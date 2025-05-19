@@ -1,0 +1,8 @@
+Dev.ipynb
+__pycache__
+.venv
+.vscode
+
+/notebooks
+/paper/overleaf
+/out
