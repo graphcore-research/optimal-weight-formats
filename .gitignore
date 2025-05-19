@@ -1,5 +1,6 @@
 Dev.ipynb
 __pycache__
+.results
 .venv
 .vscode
 

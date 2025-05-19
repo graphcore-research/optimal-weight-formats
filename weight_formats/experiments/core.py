@@ -5,27 +5,29 @@ import dataclasses
 import datetime
 import decimal
 import itertools as it
+import os
 import random
 import re
+import shelve
 import string
 import subprocess
 import sys
 import time
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Iterable
 
 import boto3
-import boto3.dynamodb
 import boto3.dynamodb.conditions as dbc
-import boto3.dynamodb.table
+import botocore
+import botocore.exceptions
 import numpy as np
 import torch
 import tqdm
 import transformers
 from torch import Tensor, nn
-
 
 # Sweeping
 
@@ -109,9 +111,7 @@ class RequantisableModel:
             del p._quantised
 
 
-# Database
-
-DB_REGION, DB_TABLE = ("eu-central-1", "2025-04-block-number-formats")
+# Utility
 
 
 class AttrDict(dict):
@@ -122,12 +122,6 @@ class AttrDict(dict):
 
 def generate_id() -> str:
     return "".join(random.choices(string.ascii_letters + string.digits, k=10))
-
-
-def _get_username() -> str | None:
-    arn = boto3.client("sts").get_caller_identity()["Arn"]
-    if m := re.search("user/(.+)", arn):
-        return m.group(1)
 
 
 def _git_head() -> str | None:
@@ -156,60 +150,229 @@ def _dump_error(error: Exception) -> dict[str, Any]:
     )
 
 
-def _to_db(value: Any, prefix: tuple[Any] = ()) -> Any:
-    if isinstance(
-        value, (str, int, decimal.Decimal, bool, type(None), bytes, bytearray)
-    ):
+def _get_username() -> str | None:
+    try:
+        arn = boto3.client("sts").get_caller_identity()["Arn"]
+        if m := re.search("user/(.+)", arn):
+            return m.group(1)
+    except botocore.exceptions.NoCredentialsError:
+        return os.environ["USER"]
+
+
+# Database API
+
+
+class _DB:
+    """Base interface for local or remote experiment storage."""
+
+    def put(self, item: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def delete(self, key: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def get(self, key: dict[str, Any]) -> AttrDict:
+        raise NotImplementedError
+
+    def query(self, key: dict[str, Any], progress: bool) -> Iterable[AttrDict]:
+        raise NotImplementedError
+
+    def keys(self, key_name: str, progress: bool) -> Iterable[str]:
+        raise NotImplementedError
+
+    def __enter__(self) -> "_DB":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        pass
+
+
+class _Dynamo(_DB):
+    def __init__(self, region: str, table: str):
+        self._table = boto3.resource("dynamodb", region_name=region).Table(table)
+
+    def put(self, item: dict[str, Any]) -> None:
+        self._table.put_item(Item=self._to_db(item))
+
+    def delete(self, key: dict[str, Any]) -> None:
+        self._table.delete_item(Key=key)
+
+    def get(self, key: dict[str, Any]) -> dict[str, Any]:
+        response = self._table.get_item(Key=key)
+        if "Item" not in response:
+            raise KeyError(f"Entry {key} not found")
+        return self._from_db(response["Item"])
+
+    def query(self, key: dict[str, Any], progress: bool) -> Iterable[AttrDict]:
+        ((key_name, key_value),) = list(key.items())  # note: restrictive
+        for item in self._call_paginated(
+            "query",
+            KeyConditionExpression=dbc.Key(key_name).eq(key_value),
+            _progress=progress,
+        ):
+            yield self._from_db(item)
+
+    def keys(self, key_name: str, progress: bool) -> Iterable[str]:
+        for x in self._call_paginated(
+            "scan", ProjectionExpression=key_name, _progress=progress
+        ):
+            yield x[key_name]
+
+    def _call_paginated(
+        self, method: str, _progress: bool, **args: Any
+    ) -> Iterable[Any]:
+        start = {}
+        with tqdm.tqdm(desc=method, disable=not _progress) as pbar:
+            while True:
+                response = getattr(self._table, method)(**args, **start)
+                pbar.update(len(response["Items"]))
+                yield from response["Items"]
+                if "LastEvaluatedKey" not in response:
+                    break
+                start = dict(ExclusiveStartKey=response["LastEvaluatedKey"])
+
+    @classmethod
+    def _to_db(cls, value: Any, prefix: tuple[Any] = ()) -> Any:
+        if isinstance(
+            value, (str, int, decimal.Decimal, bool, type(None), bytes, bytearray)
+        ):
+            return value
+        if isinstance(value, float):
+            if np.isnan(value) or np.isinf(value):
+                raise TypeError(f"Bad value {'.'.join(map(str, prefix))}={value}")
+            # Approximately match float32 precision
+            return decimal.Decimal.from_float(value).normalize(decimal.Context(prec=8))
+        if isinstance(value, torch.dtype):
+            return str(value).replace("torch.", "")
+        if isinstance(value, torch.device):
+            return value.type
+        if isinstance(value, (list, tuple)):
+            return [cls._to_db(v, prefix + (i,)) for i, v in enumerate(value)]
+        if isinstance(value, (np.ndarray, Tensor)):
+            return cls._to_db(value.tolist(), prefix)
+        if isinstance(value, set):
+            return {cls._to_db(v, prefix + ("#",)) for v in value}
+        if isinstance(value, dict):
+            non_string_keys = [k for k in value if not isinstance(k, str)]
+            if non_string_keys:
+                raise TypeError(
+                    f"Cannot convert non-string keys for the database, "
+                    f"{'.'.join(map(str, prefix))}:{set(type(k) for k in non_string_keys)}"
+                )
+            return {k: cls._to_db(v, prefix + (k,)) for k, v in value.items()}
+        raise TypeError(
+            f"Unexpected type for database, {'.'.join(map(str, prefix))}:{type(value)}"
+        )
+
+    @classmethod
+    def _from_db(cls, value: Any) -> Any:
+        if isinstance(value, decimal.Decimal):
+            return float(value)
+        if isinstance(value, list):
+            return [cls._from_db(v) for v in value]
+        if isinstance(value, set):
+            return {cls._from_db(v) for v in value}
+        if isinstance(value, dict):
+            return AttrDict(**{k: cls._from_db(v) for k, v in value.items()})
         return value
-    if isinstance(value, float):
-        if np.isnan(value) or np.isinf(value):
-            raise TypeError(f"Bad value {'.'.join(map(str, prefix))}={value}")
-        # Approximately match float32 precision
-        return decimal.Decimal.from_float(value).normalize(decimal.Context(prec=8))
-    if isinstance(value, torch.dtype):
-        return str(value).replace("torch.", "")
-    if isinstance(value, torch.device):
-        return value.type
-    if isinstance(value, (list, tuple)):
-        return [_to_db(v, prefix + (i,)) for i, v in enumerate(value)]
-    if isinstance(value, (np.ndarray, Tensor)):
-        return _to_db(value.tolist(), prefix)
-    if isinstance(value, set):
-        return {_to_db(v, prefix + ("#",)) for v in value}
-    if isinstance(value, dict):
-        non_string_keys = [k for k in value if not isinstance(k, str)]
-        if non_string_keys:
-            raise TypeError(
-                f"Cannot convert non-string keys for the database, "
-                f"{'.'.join(map(str, prefix))}:{set(type(k) for k in non_string_keys)}"
-            )
-        return {k: _to_db(v, prefix + (k,)) for k, v in value.items()}
-    raise TypeError(
-        f"Unexpected type for database, {'.'.join(map(str, prefix))}:{type(value)}"
+
+
+class _LocalDB:
+    def __init__(self, path: Path, key: tuple[str, ...]):
+        if not path.parent.exists():
+            path.parent.mkdir()
+        self._shelf = shelve.open(path).__enter__()
+        self.key = key
+
+    def _name(self, key: dict[str, Any]) -> None:
+        assert not any("/" in key[k] for k in self.key)
+        return "/".join(key[k] for k in self.key)
+
+    def put(self, item: dict[str, Any]) -> None:
+        self._shelf[self._name(item)] = self._to_db(item)
+
+    def delete(self, key: dict[str, Any]) -> None:
+        del self._shelf[self._name(key)]
+
+    def get(self, key: dict[str, Any]) -> AttrDict:
+        return self._from_db(self._shelf[self._name(key)])
+
+    def query(self, key: dict[str, Any], progress: bool) -> Iterable[AttrDict]:
+        for name in tqdm.tqdm(self._shelf, "scan", disable=not progress):
+            keylist = name.split("/")
+            if all(keylist[self.key.index(k)] == v for k, v in key.items()):
+                yield self._from_db(self._shelf[name])
+
+    def keys(self, key_name: str, progress: bool) -> Iterable[str]:
+        for name in tqdm.tqdm(self._shelf, "scan", disable=not progress):
+            yield name.split("/")[self.key.index(key_name)]
+
+    def __enter__(self) -> "_DB":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._shelf.__exit__(exc_type, exc_value, tb)
+
+    @classmethod
+    def _to_db(cls, value: Any) -> Any:
+        if isinstance(value, (np.ndarray, Tensor)):
+            return cls._to_db(value.tolist())
+        if isinstance(value, (tuple, list, set)):
+            return type(value)(cls._to_db(v) for v in value)
+        if isinstance(value, dict):
+            return {k: cls._to_db(v) for k, v in value.items()}
+        return value
+
+    @classmethod
+    def _from_db(cls, value: Any) -> Any:
+        if isinstance(value, (tuple, list, set)):
+            return type(value)(cls._from_db(v) for v in value)
+        if isinstance(value, dict):
+            return AttrDict(**{k: cls._from_db(v) for k, v in value.items()})
+        return value
+
+
+# Database
+
+DDB_REGION, DDB_TABLE = ("eu-central-1", "2025-04-block-number-formats")
+
+
+def _has_dynamo_access() -> bool:
+    try:
+        boto3.client("dynamodb", region_name=DDB_REGION).describe_table(
+            TableName=DDB_TABLE
+        )
+        return True
+    except botocore.exceptions.NoCredentialsError:
+        return False
+    except botocore.exceptions.ClientError:
+        return False
+
+
+def _db() -> _DB:
+    if _has_dynamo_access():
+        return _Dynamo(DDB_REGION, DDB_TABLE)
+    return _LocalDB(
+        Path(__file__).parent.parent.parent / ".results" / "local",
+        ("experiment", "run_id"),
     )
-
-
-def _from_db(value: Any) -> Any:
-    if isinstance(value, decimal.Decimal):
-        return float(value)
-    if isinstance(value, list):
-        return [_from_db(v) for v in value]
-    if isinstance(value, set):
-        return {_from_db(v) for v in value}
-    if isinstance(value, dict):
-        return AttrDict(**{k: _from_db(v) for k, v in value.items()})
-    return value
-
-
-def _db() -> boto3.dynamodb.table.TableResource:
-    return boto3.resource("dynamodb", region_name=DB_REGION).Table(DB_TABLE)
 
 
 class Experiment:
     """A context manager for a running experiment."""
 
     def __init__(self, config: dict[str, Any]):
-        self._db = _db()
+        self._db = _db().__enter__()
         config = config.copy()
         self.experiment = config.pop("experiment")
         self.run_id = generate_id()
@@ -232,7 +395,7 @@ class Experiment:
 
     def sync(self, unrecoverable: bool = False) -> None:
         try:
-            self._db.put_item(Item=_to_db(self._record))
+            self._db.put(self._record)
         except Exception as error:
             if unrecoverable:
                 print(
@@ -262,31 +425,19 @@ class Experiment:
         exc_value: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        if exc_value:
-            self._record.update(error=_dump_error(exc_value))
-            self._record["meta"].update(status="failed")
-        else:
-            self._record["meta"].update(status="finished")
-        self._record["meta"].update(duration=time.time() - self._t0)
-        self.sync(unrecoverable=True)
+        try:
+            if exc_value:
+                self._record.update(error=_dump_error(exc_value))
+                self._record["meta"].update(status="failed")
+            else:
+                self._record["meta"].update(status="finished")
+            self._record["meta"].update(duration=time.time() - self._t0)
+            self.sync(unrecoverable=True)
+        finally:
+            self._db.__exit__(exc_type, exc_value, tb)
 
 
-def _call_paginated(
-    db: boto3.dynamodb.table.TableResource, method: str, _progress: bool, **args: Any
-) -> Iterable[Any]:
-    start = {}
-    with tqdm.tqdm(desc=method, disable=not _progress) as pbar:
-        while True:
-            response = getattr(db, method)(**args, **start)
-            pbar.update(len(response["Items"]))
-            yield from response["Items"]
-            if "LastEvaluatedKey" not in response:
-                break
-            start = dict(ExclusiveStartKey=response["LastEvaluatedKey"])
-
-
-def _run_from_db(run: dict[str, Any]) -> dict[str, Any]:
-    run = _from_db(run)
+def _with_id(run: AttrDict) -> dict[str, Any]:
     run["id"] = f"{run.experiment}/{run.run_id}"
     return run
 
@@ -294,43 +445,34 @@ def _run_from_db(run: dict[str, Any]) -> dict[str, Any]:
 def run(id: str) -> dict[str, Any]:
     """Fetch a specific run by ID."""
     experiment, run_id = id.split("/")
-    response = _db().get_item(Key=dict(experiment=experiment, run_id=run_id))
-    if "Item" not in response:
-        raise KeyError(f"Run {id} not found")
-    return _run_from_db(response["Item"])
+    with _db() as db:
+        return _with_id(db.get(dict(experiment=experiment, run_id=run_id)))
 
 
 def runs(experiment: str, progress: bool = False) -> list[dict[str, Any]]:
     """Fetch all runs for a given experiment."""
-    items = _call_paginated(
-        _db(),
-        "query",
-        KeyConditionExpression=dbc.Key("experiment").eq(experiment),
-        _progress=progress,
-    )
-    return sorted((_run_from_db(x) for x in items), key=lambda x: x["meta"]["time"])
+    with _db() as db:
+        return sorted(
+            map(_with_id, db.query(dict(experiment=experiment), progress=progress)),
+            key=lambda x: x.meta.time,
+        )
 
 
 def update_run(run: dict[str, Any]) -> None:
     """Update the given run to reflect local changes (be careful!)"""
-    _db().put_item(Item=_to_db({k: v for k, v in run.items() if k != "id"}))
+    with _db() as db:
+        db.put({k: v for k, v in run.items() if k != "id"})
 
 
 def delete_run(id: str) -> None:
     """Remove the given run."""
     experiment, run_id = id.split("/")
-    _db().delete_item(Key=dict(experiment=experiment, run_id=run_id))
+    with _db() as db:
+        db.delete(dict(experiment=experiment, run_id=run_id))
 
 
 def experiments(progress: bool = False) -> list[str]:
     """A list of all experiments in the database."""
-    counts = collections.Counter(
-        x["experiment"]
-        for x in _call_paginated(
-            _db(),
-            "scan",
-            ProjectionExpression="experiment",
-            _progress=progress,
-        )
-    )
-    return [dict(experiment=k, runs=counts[k]) for k in sorted(counts)]
+    with _db() as db:
+        counts = collections.Counter(db.keys("experiment", progress=progress))
+        return [dict(experiment=k, runs=counts[k]) for k in sorted(counts)]
