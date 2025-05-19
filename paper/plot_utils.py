@@ -6,6 +6,7 @@ import fractions
 import inspect
 import re
 import subprocess
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -273,6 +274,17 @@ def fmt_latex_booktabs(df: pd.DataFrame, cols: dict[str, str]) -> str:
 # Paper sync
 
 OVERLEAF = Path(__file__).parent / "overleaf"
+WARN_NO_OVERLEAF = False
+
+
+def _check_overleaf_cloned() -> bool:
+    if not OVERLEAF.exists():
+        if WARN_NO_OVERLEAF:
+            warnings.warn(
+                f"Repository not found at {OVERLEAF}, disabling save-and-push"
+            )
+        return False
+    return True
 
 
 def push_to_paper() -> None:
@@ -291,14 +303,10 @@ def push_to_paper() -> None:
 
 def save(name: str, push: bool = True) -> None:
     """Save and push a figure to the paper."""
-    root = OVERLEAF / "fig"
-    if not root.exists():
-        raise ValueError(
-            f"Couldn't find {root} - please clone the paper into overleaf/"
-        )
-    plt.savefig(root / f"{name}.pdf", bbox_inches="tight")
-    if push:
-        push_to_paper()
+    if _check_overleaf_cloned():
+        plt.savefig(OVERLEAF / "fig" / f"{name}.pdf", bbox_inches="tight")
+        if push:
+            push_to_paper()
 
 
 def save_code(fn: Callable[..., Any], push: bool = True) -> None:
@@ -307,24 +315,16 @@ def save_code(fn: Callable[..., Any], push: bool = True) -> None:
     body = [x for x in body if "# IGNORE" not in x]
     code = "\n".join(body) + "\n"
 
-    root = OVERLEAF / "code"
-    if not root.exists():
-        raise ValueError(
-            f"Couldn't find {root} - please clone the paper into overleaf/"
-        )
-    (root / f"{fn.__name__}.py").write_text(code)
-    if push:
-        push_to_paper()
+    if _check_overleaf_cloned():
+        (OVERLEAF / "code" / f"{fn.__name__}.py").write_text(code)
+        if push:
+            push_to_paper()
 
 
 def save_table(
     name: str, df: pd.DataFrame, cols: dict[str, str], push: bool = True
 ) -> str:
-    root = OVERLEAF / "tab"
-    if not root.exists():
-        raise ValueError(
-            f"Couldn't find {root} - please clone the paper into overleaf/"
-        )
-    (root / f"{name}.tex").write_text(fmt_latex_booktabs(df, cols=cols))
-    if push:
-        push_to_paper()
+    if _check_overleaf_cloned():
+        (OVERLEAF / "tab" / f"{name}.tex").write_text(fmt_latex_booktabs(df, cols=cols))
+        if push:
+            push_to_paper()
