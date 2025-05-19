@@ -19,3 +19,7 @@ source .venv
 pip install -r requirements.txt
 ./scripts/check.sh
 ```
+
+## License
+
+Copyright (c) 2025 Graphcore Ltd. Licensed under the MIT License.
