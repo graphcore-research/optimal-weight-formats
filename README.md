@@ -1,6 +1,6 @@
 # Optimal Weight Formats
 
-Code to reproduce the experiments of Optimal Formats for Weight Quantisation.
+Code to reproduce the experiments of [Optimal Formats for Weight Quantisation](https://arxiv.org/abs/2505.12988).
 
 We recommend starting with [`Demo.ipynb`](Demo.ipynb) for an introduction to the main results of the paper.
 
