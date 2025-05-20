@@ -283,7 +283,7 @@ def _scaled_element_format(
             else list(range(2, element_bits))
         )
         format_with_rmse = [
-            find_scaled_format(Q.FPFormat(e, element_bits - e - 1, **args))
+            find_scaled_format(Q.FPFormat.create(e, element_bits - e - 1, **args))
             for e in candidate_exponent_bits
         ]
         return min(format_with_rmse, key=lambda x: x[1])[0]

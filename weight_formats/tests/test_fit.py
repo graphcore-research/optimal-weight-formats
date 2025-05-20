@@ -6,7 +6,7 @@ from .. import fit as F
 from .. import quantisation as Q
 
 
-def test_scaled_quantiser() -> None:
+def test_scaled() -> None:
     torch.manual_seed(100)
     x = 3 * torch.randn(2**16)
     tol = 0.1
@@ -29,6 +29,11 @@ def test_scaled_quantiser() -> None:
     ).fit(x)
     assert 4.75 - tol < fmt.count_bits_tensor(x) / x.nelement() < 4.75 + tol
     assert Q.qrmse_norm(fmt, x).item() < 0.08  # empirical
+
+    # Rotation (doesn't help when x ~ Normal)
+    fmt = F.Scaled(4, "int", Q.BFLOAT16, (None,), "rms", rotation=123).fit(x)
+    assert fmt.count_bits_tensor(x) / x.nelement() == 4 + 16 / x.nelement()
+    assert Q.qrmse_norm(fmt, x).item() < 0.14  # empirical
 
     # Lloyd-Max
     fmt = F.Scaled(4, "lloyd_max", Q.BFLOAT16, (32,), "signmax", compressor=None).fit(x)

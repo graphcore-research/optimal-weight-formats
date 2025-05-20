@@ -1,5 +1,7 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
+"""Wrappers to calculate gradient-squared (Fisher information) statistics."""
+
 import torch
 from torch import Tensor, nn
 
@@ -116,6 +118,7 @@ class EmbeddingWrapper(Wrapper):
 
 
 def wrap(model: nn.Module) -> None:
+    """Wrap all eligible modules to calculate grad-squared stats."""
     for m in model.modules():
         if not isinstance(m, Wrapper):
             for name, child in m.named_children():
@@ -126,6 +129,7 @@ def wrap(model: nn.Module) -> None:
 
 
 def unwrap(model: nn.Module) -> None:
+    """Remove all wrappers, restoring the model to pre-wrap state."""
     for m in model.modules():
         for name, child in m.named_children():
             if isinstance(child, Wrapper):

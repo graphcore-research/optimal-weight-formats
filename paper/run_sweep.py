@@ -137,7 +137,7 @@ def _scale_mantissa() -> Iterable[ET.Test]:
             fmt = F.Scaled(
                 element_bits=element_bits - (mbits + 8) / 128,
                 element_family="t",
-                scale_format=Q.FPFormat(7, mbits, "to_inf"),
+                scale_format=Q.FPFormat.create(7, mbits, "to_inf"),
                 block_shape=(1, 128),
                 scaling="absmax",
             )

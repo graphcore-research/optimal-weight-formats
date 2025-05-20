@@ -115,7 +115,18 @@ class FPFormat(ScalarFormat):
     exponent_bits: int
     mantissa_bits: int
     rounding: Literal["nearest", "to_inf", "to_zero"]
+    signed: bool
     _type: str = "fp"
+
+    @classmethod
+    def create(
+        cls,
+        exponent_bits: int,
+        mantissa_bits: int,
+        rounding: Literal["nearest", "to_inf", "to_zero"] = "nearest",
+        signed: bool = True,
+    ) -> "FPFormat":
+        return cls(exponent_bits, mantissa_bits, rounding, signed)
 
     def __post_init__(self) -> None:
         if self.exponent_bits < 2 or self.mantissa_bits < 0:
@@ -126,17 +137,18 @@ class FPFormat(ScalarFormat):
             )
 
     def __str__(self) -> str:
-        return f"E{self.exponent_bits}M{self.mantissa_bits}"
+        signflag = "U" if not self.signed else ""
+        return f"{signflag}E{self.exponent_bits}M{self.mantissa_bits}"
 
     @property
     def bits(self) -> float:
-        return 1 + self.exponent_bits + self.mantissa_bits
+        return self.signed + self.exponent_bits + self.mantissa_bits
 
     @property
     def range(self) -> tuple[float, float]:
         max_exponent = 2 ** (self.exponent_bits - 1) - 1
         absmax = cast(float, 2**max_exponent * (2 - 2**-self.mantissa_bits))
-        return (-absmax, absmax)
+        return (self.signed * -absmax, absmax)
 
     @property
     def min_absolute_normal(self) -> float:
@@ -152,6 +164,9 @@ class FPFormat(ScalarFormat):
             torch.float32,
             torch.bfloat16,
         ], "Quantising is only supported from bfloat16 and float32"
+
+        if not self.signed:
+            x = x.clamp_min(0)
 
         downscale = 2.0 ** (127 - 2 ** (self.exponent_bits - 1))
         m_bits_before = {torch.float32: 23, torch.bfloat16: 7}[x.dtype]
@@ -174,21 +189,6 @@ class FPFormat(ScalarFormat):
         q *= downscale
 
         return q.to(x.dtype)
-
-
-@dataclass
-class FPFormat_NoSign(FPFormat):
-    _type: str = "fp_nosign"
-
-    def __str__(self) -> str:
-        return f"{super().__str__()}+"
-
-    @property
-    def bits(self) -> float:
-        return self.exponent_bits + self.mantissa_bits
-
-    def quantise(self, x: Tensor) -> Tensor:
-        return super().quantise(x.clamp_min(0))
 
 
 @dataclass
@@ -320,6 +320,7 @@ class LUTFormat(ScalarFormat):
 
     def __post_init__(self) -> None:
         self.values = tuple(self.values)
+        self._range = tuple(self._range)
 
     def __str__(self) -> str:
         return f"LUT{int(math.ceil(self.bits))}[{self.name}]"
@@ -341,192 +342,6 @@ class LUTFormat(ScalarFormat):
     def quantise(self, x: Tensor) -> Tensor:
         values = torch.tensor(self.values, device=x.device, dtype=x.dtype)
         return values[self.to_idx(x)]
-
-
-def parse(value: str) -> ScalarFormat:
-    if value == "FP32":
-        return FP32
-    if value == "FP16":
-        return FP16
-    if value == "BFLOAT16":
-        return BFLOAT16
-    m = re.match(r"^E(\d+)M(\d+)(-(RN|RZ|RI))?$", value)
-    if m:
-        exponent_bits = int(m.group(1))
-        mantissa_bits = int(m.group(2))
-        if exponent_bits == 0:
-            assert not m.group(3)
-            return IntFormat(1 + mantissa_bits)
-        if exponent_bits >= 2:
-            rounding = cast(
-                Literal["nearest", "to_inf", "to_zero"],
-                {
-                    None: "nearest",
-                    "-RN": "nearest",
-                    "-RZ": "to_zero",
-                    "-RI": "to_inf",
-                }[m.group(3)],
-            )
-            return FPFormat(exponent_bits, mantissa_bits, rounding)
-        raise ValueError(f"No format {value!r} available (note: E1M6 == E0M7)")
-    m = re.match(r"EXP(\d+)", value)
-    if m:
-        return ExpCeilFormat(int(m.group(1)))
-    raise ValueError(f"Couldn't parse {value!r}")
-
-
-def lut_function(fn: Callable[[Tensor], Tensor], bits: int, name: str) -> LUTFormat:
-    """A lookup table quantiser based on mapping [-1, 1] via a function"""
-    return LUTFormat.create(fn(torch.linspace(-1, 1, steps=2**bits)), name)
-
-
-def lut_grid(resolution: float, max: float) -> LUTFormat:
-    """A fixed-resolution grid that spans (-max, max)."""
-    half_n = torch.tensor(max).div(resolution).ceil().long().item()
-    values = torch.arange(-half_n, half_n + 1).mul(resolution)
-    return LUTFormat.create(values, f"GRID{{{resolution}}}")
-
-
-# Wrappers
-
-
-@dataclass
-class ScaledFormat(ScalarFormat):
-    format: ScalarFormat
-    scale: float
-    _range: tuple[float, float]
-    _type: str = "scaled"
-
-    @classmethod
-    def create(
-        cls,
-        format: ScalarFormat,
-        scale: float,
-        range: tuple[float, float] | None = None,
-    ) -> "ScaledFormat":
-        if range is None:
-            min_, max_ = format.range
-            range = (min_ * scale, max_ * scale)
-        return cls(format=format, scale=scale, _range=range)
-
-    def __str__(self) -> str:
-        return f"{self.format}{{*{self.scale:.3g}}}"
-
-    @property
-    def bits(self) -> float:
-        return self.format.bits
-
-    @property
-    def range(self) -> tuple[float, float]:
-        return self._range
-
-    def quantise(self, tensor: Tensor) -> Tensor:
-        return self.format.quantise(tensor / self.scale) * self.scale
-
-    def count_bits_tensor(self, tensor: Tensor) -> float:
-        return self.format.count_bits_tensor(tensor / self.scale)
-
-
-@dataclass
-class RandomRotationFormat(TensorFormat):
-    format: TensorFormat
-    dims: tuple[int, ...]
-    seed: int
-    _type: str = "random_rotation"
-
-    def __str__(self) -> str:
-        return f"{self.format}{{rot{list(self.dims)}}}"
-
-    @staticmethod
-    def rotate(
-        tensor: Tensor, dims: tuple[int, ...], seed: int
-    ) -> tuple[Tensor, list[Tensor]]:
-        """Returns (rotated, [rotations, ...])."""
-        generator = torch.Generator(tensor.device).manual_seed(seed)
-        rotations = [
-            torch.nn.init.orthogonal_(
-                torch.empty(tensor.shape[dim], tensor.shape[dim], device=tensor.device),
-                generator=generator,
-            ).to(tensor.dtype)
-            for dim in dims
-        ]
-        for dim, rotation in zip(dims, rotations):
-            tensor = (tensor.movedim(dim, -1) @ rotation).movedim(-1, dim)
-        return tensor, rotations
-
-    @staticmethod
-    def unrotate(
-        tensor: Tensor, dims: tuple[int, ...], rotations: list[Tensor]
-    ) -> Tensor:
-        for dim, rotation in zip(dims, rotations):
-            tensor = (tensor.movedim(dim, -1) @ rotation.T).movedim(-1, dim)
-        return tensor
-
-    def quantise(self, tensor: Tensor) -> Tensor:
-        tensor, rotations = self.rotate(tensor, self.dims, self.seed)
-        return self.unrotate(self.format.quantise(tensor), self.dims, rotations)
-
-    def count_bits(self, shape: Shape) -> int:
-        return self.format.count_bits(shape)
-
-    def count_bits_tensor(self, tensor: Tensor) -> float:
-        tensor, _ = self.rotate(tensor, self.dims, self.seed)
-        return self.format.count_bits_tensor(tensor)
-
-
-@dataclass
-class SparseFormat(TensorFormat):
-    """A format wrapper that first removes a fixed percentage of absmax "outliers"."""
-
-    format: TensorFormat
-    sparse_format: ScalarFormat
-    sparse_ratio: float
-    _type: str = "outlier"
-
-    @staticmethod
-    def n_sparse(shape: Shape, sparse_ratio: float) -> int:
-        return int(sparse_ratio * math.prod(shape))
-
-    @classmethod
-    def split(
-        cls, tensor: Tensor, sparse_ratio: float
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Split-out and zero sparse (absmax) values.
-
-        returns -- `(dense, sparse_idx, sparse_values)`
-        """
-        n_sparse = cls.n_sparse(tensor.shape, sparse_ratio)
-        sparse_idx = torch.topk(tensor.abs().flatten(), n_sparse, sorted=False).indices
-        dense = tensor.clone()
-        dense.flatten()[sparse_idx] = 0
-        return dense, sparse_idx, tensor.flatten()[sparse_idx]
-
-    def __str__(self) -> str:
-        sparse_ratio = format(
-            self.sparse_ratio, ".1%" if 1e-3 <= self.sparse_ratio else ".0e"
-        )
-        return f"{self.format}+S[{sparse_ratio}:{self.sparse_format}]"
-
-    def quantise(self, tensor: Tensor) -> Tensor:
-        tensor, sparse_idx, sparse_values = self.split(tensor, self.sparse_ratio)
-        tensor = self.format.quantise(tensor)
-        tensor.flatten()[sparse_idx] = self.sparse_format.quantise(sparse_values)
-        return tensor
-
-    def count_sparse_bits(self, shape: Shape) -> int:
-        n_sparse = self.n_sparse(shape, self.sparse_ratio)
-        sparse_value_bits = self.sparse_format.count_bits((n_sparse,))
-        sparse_mask_bits = 32 * n_sparse  # flat-COO format
-        return sparse_value_bits + sparse_mask_bits
-
-    def count_bits(self, shape: Shape) -> int:
-        return self.format.count_bits(shape) + self.count_sparse_bits(shape)
-
-    def count_bits_tensor(self, tensor: Tensor) -> float:
-        tensor, _, _ = self.split(tensor, self.sparse_ratio)
-        return self.format.count_bits_tensor(tensor) + self.count_sparse_bits(
-            tensor.shape
-        )
 
 
 # Lloyd-Max
@@ -662,6 +477,54 @@ def lut_lloyd_max(
             n *= 2
     assert (midpoints[:-1] <= midpoints[1:]).all().item()
     return LUTFormat.create(midpoints, "LM", range=range)
+
+
+# Scalar format utilities
+
+
+def parse(value: str) -> ScalarFormat:
+    if value == "FP32":
+        return FP32
+    if value == "FP16":
+        return FP16
+    if value == "BFLOAT16":
+        return BFLOAT16
+    m = re.match(r"^(U?)E(\d+)M(\d+)(-(RN|RZ|RI))?$", value)
+    if m:
+        signed = m.group(1) != "U"
+        exponent_bits = int(m.group(2))
+        mantissa_bits = int(m.group(3))
+        if exponent_bits == 0:
+            assert not m.group(4)
+            return IntFormat(1 + mantissa_bits)
+        if exponent_bits >= 2:
+            rounding = cast(
+                Literal["nearest", "to_inf", "to_zero"],
+                {
+                    None: "nearest",
+                    "-RN": "nearest",
+                    "-RZ": "to_zero",
+                    "-RI": "to_inf",
+                }[m.group(4)],
+            )
+            return FPFormat(exponent_bits, mantissa_bits, rounding, signed)
+        raise ValueError(f"No format {value!r} available (note: E1M6 == E0M7)")
+    m = re.match(r"EXP(\d+)", value)
+    if m:
+        return ExpCeilFormat(int(m.group(1)))
+    raise ValueError(f"Couldn't parse {value!r}")
+
+
+def lut_function(fn: Callable[[Tensor], Tensor], bits: int, name: str) -> LUTFormat:
+    """A lookup table quantiser based on mapping [-1, 1] via a function"""
+    return LUTFormat.create(fn(torch.linspace(-1, 1, steps=2**bits)), name)
+
+
+def lut_grid(resolution: float, max: float) -> LUTFormat:
+    """A fixed-resolution grid that spans (-max, max)."""
+    half_n = torch.tensor(max).div(resolution).ceil().long().item()
+    values = torch.arange(-half_n, half_n + 1).mul(resolution)
+    return LUTFormat.create(values, f"GRID{{{resolution}}}")
 
 
 def nf_approx(bits: int) -> LUTFormat:
@@ -909,6 +772,148 @@ def crd_block_t(
     )
 
 
+# Wrappers
+
+
+@dataclass
+class ScaledFormat(ScalarFormat):
+    format: ScalarFormat
+    scale: float
+    _range: tuple[float, float]
+    _type: str = "scaled"
+
+    @classmethod
+    def create(
+        cls,
+        format: ScalarFormat,
+        scale: float,
+        range: tuple[float, float] | None = None,
+    ) -> "ScaledFormat":
+        if range is None:
+            min_, max_ = format.range
+            range = (min_ * scale, max_ * scale)
+        return cls(format=format, scale=scale, _range=range)
+
+    def __str__(self) -> str:
+        return f"{self.format}{{*{self.scale:.3g}}}"
+
+    @property
+    def bits(self) -> float:
+        return self.format.bits
+
+    @property
+    def range(self) -> tuple[float, float]:
+        return self._range
+
+    def quantise(self, tensor: Tensor) -> Tensor:
+        return self.format.quantise(tensor / self.scale) * self.scale
+
+    def count_bits_tensor(self, tensor: Tensor) -> float:
+        return self.format.count_bits_tensor(tensor / self.scale)
+
+
+@dataclass
+class RandomRotationFormat(TensorFormat):
+    format: TensorFormat
+    dims: tuple[int, ...]
+    seed: int
+    _type: str = "random_rotation"
+
+    def __str__(self) -> str:
+        return f"{self.format}{{rot{list(self.dims)}}}"
+
+    @staticmethod
+    def rotate(
+        tensor: Tensor, dims: tuple[int, ...], seed: int
+    ) -> tuple[Tensor, list[Tensor]]:
+        """Returns (rotated, [rotations, ...])."""
+        generator = torch.Generator(tensor.device).manual_seed(seed)
+        rotations = [
+            torch.nn.init.orthogonal_(
+                torch.empty(tensor.shape[dim], tensor.shape[dim], device=tensor.device),
+                generator=generator,
+            ).to(tensor.dtype)
+            for dim in dims
+        ]
+        for dim, rotation in zip(dims, rotations):
+            tensor = (tensor.movedim(dim, -1) @ rotation).movedim(-1, dim)
+        return tensor, rotations
+
+    @staticmethod
+    def unrotate(
+        tensor: Tensor, dims: tuple[int, ...], rotations: list[Tensor]
+    ) -> Tensor:
+        for dim, rotation in zip(dims, rotations):
+            tensor = (tensor.movedim(dim, -1) @ rotation.T).movedim(-1, dim)
+        return tensor
+
+    def quantise(self, tensor: Tensor) -> Tensor:
+        tensor, rotations = self.rotate(tensor, self.dims, self.seed)
+        return self.unrotate(self.format.quantise(tensor), self.dims, rotations)
+
+    def count_bits(self, shape: Shape) -> int:
+        return self.format.count_bits(shape)
+
+    def count_bits_tensor(self, tensor: Tensor) -> float:
+        tensor, _ = self.rotate(tensor, self.dims, self.seed)
+        return self.format.count_bits_tensor(tensor)
+
+
+@dataclass
+class SparseFormat(TensorFormat):
+    """A format wrapper that first removes a fixed percentage of absmax "outliers"."""
+
+    format: TensorFormat
+    sparse_format: ScalarFormat
+    sparse_ratio: float
+    _type: str = "outlier"
+
+    @staticmethod
+    def n_sparse(shape: Shape, sparse_ratio: float) -> int:
+        return int(sparse_ratio * math.prod(shape))
+
+    @classmethod
+    def split(
+        cls, tensor: Tensor, sparse_ratio: float
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Split-out and zero sparse (absmax) values.
+
+        returns -- `(dense, sparse_idx, sparse_values)`
+        """
+        n_sparse = cls.n_sparse(tensor.shape, sparse_ratio)
+        sparse_idx = torch.topk(tensor.abs().flatten(), n_sparse, sorted=False).indices
+        dense = tensor.clone()
+        dense.flatten()[sparse_idx] = 0
+        return dense, sparse_idx, tensor.flatten()[sparse_idx]
+
+    def __str__(self) -> str:
+        sparse_ratio = format(
+            self.sparse_ratio, ".1%" if 1e-3 <= self.sparse_ratio else ".0e"
+        )
+        return f"{self.format}+S[{sparse_ratio}:{self.sparse_format}]"
+
+    def quantise(self, tensor: Tensor) -> Tensor:
+        tensor, sparse_idx, sparse_values = self.split(tensor, self.sparse_ratio)
+        tensor = self.format.quantise(tensor)
+        tensor.flatten()[sparse_idx] = self.sparse_format.quantise(sparse_values)
+        return tensor
+
+    def count_sparse_bits(self, shape: Shape) -> int:
+        n_sparse = self.n_sparse(shape, self.sparse_ratio)
+        sparse_value_bits = self.sparse_format.count_bits((n_sparse,))
+        sparse_mask_bits = 32 * n_sparse  # flat-COO format
+        return sparse_value_bits + sparse_mask_bits
+
+    def count_bits(self, shape: Shape) -> int:
+        return self.format.count_bits(shape) + self.count_sparse_bits(shape)
+
+    def count_bits_tensor(self, tensor: Tensor) -> float:
+        tensor, _, _ = self.split(tensor, self.sparse_ratio)
+        return self.format.count_bits_tensor(tensor) + self.count_sparse_bits(
+            tensor.shape
+        )
+
+
 # Tensor formats
 
 BlockShape = Tuple[Optional[int], ...]
@@ -1037,7 +1042,7 @@ class LinearScalingFormat(TensorFormat):
         return self.element_format.quantise(scaled_tensor) * scale
 
 
-# "Compression" formats
+# Compression formats
 
 
 class CompressedTensorFormat(TensorFormat):
