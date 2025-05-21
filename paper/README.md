@@ -2,7 +2,7 @@
 
 This page describes the steps required to reproduce results from the Optimal Formats for Weight Quantisation paper.
 
-The interconnected nature of runs makes the reproduction procedure somewhat hard to test, so some debugging might be required. For a very simplified reproduction of _some_ key results, please see [Demo.ipynb](../Demo.ipynb).
+The interconnected nature of runs makes the reproduction procedure somewhat hard to test, so some debugging might be required. For a very simplified reproduction of _some_ key results, please see [`Demo.ipynb`](../Demo.ipynb).
 
 **Outline:**
 

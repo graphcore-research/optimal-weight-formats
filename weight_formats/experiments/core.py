@@ -126,7 +126,13 @@ def generate_id() -> str:
 
 def _git_head() -> str | None:
     try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         return None
 

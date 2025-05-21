@@ -19,7 +19,7 @@ We recommend starting with [`Demo.ipynb`](Demo.ipynb) for an introduction to the
 ```sh
 python3 -m venv .venv
 echo 'export PYTHONPATH="${PYTHONPATH}:$(dirname ${VIRTUAL_ENV})"' >> .venv/bin/activate
-source .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ./scripts/check.sh
 ```
