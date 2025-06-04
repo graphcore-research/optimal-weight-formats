@@ -3,6 +3,7 @@
 """Wrappers to calculate gradient-squared (Fisher information) statistics."""
 
 import torch
+import transformers
 from torch import Tensor, nn
 
 
@@ -48,6 +49,8 @@ class Wrapper(nn.Module):
 class LinearWrapper(Wrapper):
     """Wraps a linear layer, to calculate sum(grad_weight**2), sum(input**2), sum(grad_output**2)."""
 
+    SUPPORTED_TYPES = (nn.Linear,)
+
     def __init__(self, wrapped: nn.Linear):
         super().__init__()
         self.wrapped = wrapped
@@ -73,6 +76,13 @@ class LinearWrapper(Wrapper):
 
 
 class EmbeddingWrapper(Wrapper):
+    """Wraps an embedding layer, to calculate sum(grad_weight**2), sum(input**2), sum(grad_output**2)."""
+
+    SUPPORTED_TYPES = (
+        nn.Embedding,
+        transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding,
+    )
+
     def __init__(self, wrapped: nn.Embedding):
         super().__init__()
         # We can ignore `padding_idx`, as it has the same behaviour as any other index
@@ -94,6 +104,10 @@ class EmbeddingWrapper(Wrapper):
         y.requires_grad_(True).register_hook(
             lambda grad_output: self._ongrad(input.detach(), grad_output.detach())
         )
+        if hasattr(self.wrapped, "embed_scale"):
+            # For Gemma3TextScaledWordEmbedding
+            # Note: must come after register_hook()
+            y = y * self.wrapped.embed_scale
         return y
 
     def _ongrad(self, input: Tensor, grad_output: Tensor) -> None:
@@ -123,8 +137,18 @@ def wrap(model: nn.Module) -> None:
         if not isinstance(m, Wrapper):
             for name, child in m.named_children():
                 if isinstance(child, nn.Linear):
+                    if not any(t == type(child) for t in LinearWrapper.SUPPORTED_TYPES):
+                        raise TypeError(
+                            f"Cannot wrap nn.Linear subclass: {type(child)}"
+                        )
                     setattr(m, name, LinearWrapper(child))
                 if isinstance(child, nn.Embedding):
+                    if not any(
+                        t == type(child) for t in EmbeddingWrapper.SUPPORTED_TYPES
+                    ):
+                        raise TypeError(
+                            f"Cannot wrap nn.Embedding subclass: {type(child)}"
+                        )
                     setattr(m, name, EmbeddingWrapper(child))
 
 
