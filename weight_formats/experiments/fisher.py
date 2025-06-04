@@ -18,7 +18,7 @@ from .. import model_quantisation as M
 from . import core, token_prediction
 
 
-EXPERIMENT_DEFAULT = "20250423-fisher"
+EXPERIMENT_DEFAULT = "20250604-fisher"
 
 
 def fetch_fisher(
