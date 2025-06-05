@@ -47,10 +47,18 @@ if __name__ == "__main__":
     MOD_ALL = E.MODELS
     MOD_LLAMA8B = ["meta-llama/Llama-3.1-8B"]
     MOD_NOT_LLAMA8B = [m for m in MOD_ALL if m not in MOD_LLAMA8B]
+    MOD_GEMMA = [
+        "google/gemma-3-1b-pt",
+        "google/gemma-3-4b-pt",
+        "google/gemma-3-12b-pt",
+    ]
 
     s = []
     s.append(dict(name="fisher-code", tests=list(_fisher(0.25)), models=MOD_LLAMA8B))
     s.append(dict(name="fisher-code", tests=list(_fisher(1)), models=MOD_NOT_LLAMA8B))
+    s.append(
+        dict(name="fisher-code-gemmafix", tests=list(_fisher(1)), models=MOD_GEMMA)
+    )
 
     for sweep in s:
         print(
