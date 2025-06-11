@@ -472,44 +472,16 @@ class _Runner:
                 traceback.print_exc()
 
 
-_SWEEP_RUNNER: _Runner | None = None
-
-
-def _sweep_init(queue: multiprocessing.Queue) -> None:
-    # CUDA_VISIBLE_DEVICES seems better than using torch.device at
-    # reusing the torch.compile cache between GPUs
-    device = queue.get_nowait()
-    if device is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
-    torch.set_num_threads(16)  # avoid CPU contention when sweeping
-    global _SWEEP_RUNNER
-    _SWEEP_RUNNER = _Runner()
-
-
-def _sweep_run(run: Run) -> None:
-    _SWEEP_RUNNER(run, progress=False)
-
-
 def run_sweep(runs: Iterable[Run], processes: int | None = None) -> None:
-    if processes is None:
-        processes = torch.cuda.device_count() if torch.cuda.is_available() else 1
-
-    if processes == 1:
-        # Run directly in the host process (easier to debug)
-        runner = _Runner()
-        for run in runs:
-            runner(run, progress=True)
-    else:
-        # Start subprocesses that "own" device IDs then use a pool to divide work
-        queue = multiprocessing.Manager().Queue()
-        for idx in range(processes):
-            queue.put(
-                (idx % torch.cuda.device_count()) if torch.cuda.is_available() else None
+    core.run_sweep(
+        _Runner,
+        [(run,) for run in runs],
+        processes=processes,
+        kwargs=dict(
+            progress=(
+                processes
+                or (torch.cuda.device_count() if torch.cuda.is_available() else 1)
             )
-        pool = multiprocessing.get_context("spawn").Pool(
-            processes, _sweep_init, (queue,)
-        )
-        for run in runs:
-            pool.apply_async(_sweep_run, (run,))
-        pool.close()
-        pool.join()
+            == 1
+        ),
+    )

@@ -1,3 +1,5 @@
+git+https://github.com/allenai/olmes@4f04122642bcee6d74393ec2ecfb0e572a64da53
+
 accelerate==1.6.0
 arithmetic_compressor==0.2
 boto3==1.37.35
@@ -12,5 +14,5 @@ pytest==8.3.5
 scipy==1.15.2
 seaborn==0.13.2
 torch==2.6.0
-transformers==4.51.3
+transformers==4.50.3
 triton==3.2.0

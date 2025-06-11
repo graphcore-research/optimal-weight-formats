@@ -5,6 +5,7 @@ import dataclasses
 import datetime
 import decimal
 import itertools as it
+import multiprocessing
 import os
 import random
 import re
@@ -17,7 +18,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Type
 
 import boto3
 import boto3.dynamodb.conditions as dbc
@@ -482,3 +483,61 @@ def experiments(progress: bool = False) -> list[str]:
     with _db() as db:
         counts = collections.Counter(db.keys("experiment", progress=progress))
         return [dict(experiment=k, runs=counts[k]) for k in sorted(counts)]
+
+
+# Sweeping
+
+_SWEEP_RUNNER: Callable[..., None] = None
+
+
+def _sweep_init(queue: multiprocessing.Queue, runner: Type[Any]) -> None:
+    # CUDA_VISIBLE_DEVICES seems better than using torch.device at
+    # reusing the torch.compile cache between GPUs
+    device = queue.get_nowait()
+    if device is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
+    torch.set_num_threads(16)  # avoid CPU contention when sweeping
+    global _SWEEP_RUNNER
+    _SWEEP_RUNNER = runner()
+
+
+def _try_run(runner: Callable[..., None], args: Any, kwargs: dict[str, Any]) -> None:
+    try:
+        runner(*args, **kwargs)
+    except Exception:
+        print(f"### Sweep run error for args={args} kwargs={kwargs}", file=sys.stderr)
+        traceback.print_exc()
+
+
+def _sweep_run(args: Any, kwargs: dict[str, Any]) -> None:
+    _try_run(_SWEEP_RUNNER, args, kwargs)
+
+
+def run_sweep(
+    runner: Type[Any],
+    sweep_args: Iterable[tuple[Any, ...]],
+    processes: int | None = None,
+    kwargs: dict[str, Any] = {},
+) -> None:
+    if processes is None:
+        processes = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+    if processes == 1:
+        # Run directly in the host process (easier to debug)
+        runner = runner()
+        for args in sweep_args:
+            _try_run(runner, args, kwargs)
+    else:
+        # Start subprocesses that "own" device IDs then use a pool to divide work
+        queue = multiprocessing.Manager().Queue()
+        for idx in range(processes):
+            queue.put(
+                (idx % torch.cuda.device_count()) if torch.cuda.is_available() else None
+            )
+        pool = multiprocessing.get_context("spawn").Pool(
+            processes, _sweep_init, (queue, runner)
+        )
+        for args in sweep_args:
+            pool.apply_async(_sweep_run, (args, kwargs))
+        pool.close()
+        pool.join()

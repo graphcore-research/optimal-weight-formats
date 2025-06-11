@@ -82,6 +82,13 @@ def _quantise_named_parameter(name: str, *args: Any, **kwargs: Any) -> None:
         raise ValueError(f"Failed to quantise {name!r}") from e
 
 
+def no_quantisation(
+    model: nn.Module, ignore: tuple[str, ...] = DEFAULT_IGNORE
+) -> dict[str, Any]:
+    """Return a quantisation result dictionary for an unquantised model."""
+    return _quantisation_log(model, verbose=False, ignore=ignore)
+
+
 def quantise_2d_fixed(
     model: nn.Module,
     fmt_spec: FmtSpec,
