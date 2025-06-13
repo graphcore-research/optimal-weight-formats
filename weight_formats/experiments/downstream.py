@@ -23,18 +23,19 @@ class Task:
 
 TASKS = [
     Task(name=name, limit=d.get("limit"))
-    for base_name, d in [
-        ("arc_challenge", {}),
-        ("arc_easy", {}),
+    for name, d in [
+        # Selected cloze vs multiple-choice based on a baseline sweep
+        # (20250611-downstream-baselines)
+        ("arc_challenge:mc", {}),
+        ("arc_easy:mc", {}),
         ("boolq", {}),
-        ("csqa", {}),
+        ("csqa:mc", {}),
         ("hellaswag", dict(limit=1000)),
-        ("openbookqa", {}),
+        ("openbookqa:mc", {}),
         ("piqa", {}),
-        ("socialiqa", {}),
+        ("socialiqa:mc", {}),
         ("winogrande", {}),
     ]
-    for name in [base_name, f"{base_name}:mc"]
 ]
 
 
