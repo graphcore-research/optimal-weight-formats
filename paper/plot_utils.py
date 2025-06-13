@@ -4,6 +4,7 @@
 
 import fractions
 import inspect
+import logging
 import re
 import subprocess
 import warnings
@@ -105,6 +106,7 @@ def configure(disable_tex_for_debug_speed: bool = False) -> None:
         "Recommend (Ubuntu):\n"
         "  sudo apt-get install cm-super dvipng fonts-cmu texlive-latex-extra"
     )
+    logging.getLogger("matplotlib.texmanager").setLevel(logging.WARNING)
     sns.set_context("paper", font_scale=1.5)
     sns.set_style("ticks")
     sns.set_palette(PALETTE)
