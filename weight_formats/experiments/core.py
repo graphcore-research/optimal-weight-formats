@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -164,6 +165,19 @@ def _get_username() -> str | None:
             return m.group(1)
     except botocore.exceptions.NoCredentialsError:
         return os.environ["USER"]
+
+
+@contextmanager
+def cuda_memory_history(
+    path: str | Path, max_entries: int = int(1e5)
+) -> Iterable[None]:
+    torch.cuda.memory._record_memory_history(max_entries=max_entries)
+    try:
+        yield
+    finally:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(path)
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 # Database API

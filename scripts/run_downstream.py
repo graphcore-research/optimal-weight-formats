@@ -1,6 +1,6 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
-import weight_formats.experiments.downstream as ED
+import weight_formats.experiments.qat as EQ
 import weight_formats.fit as F
 import weight_formats.quantisation as Q
 
@@ -15,9 +15,9 @@ if __name__ == "__main__":
             scaling="absmax",
         ),
     ]
-    ED.run_sweep(
+    EQ.run_sweep(
         [
-            ED.Run("dev", "meta-llama/Llama-3.2-1B", tasks=ED.TASKS[:2], fmt=fmt)
+            EQ.Run("dev", "meta-llama/Llama-3.2-1B", tasks=EQ.TASKS[:2], fmt=fmt)
             for fmt in formats
         ]
     )

@@ -10,9 +10,59 @@ import oe_eval.run_eval
 import oe_eval.tasks.oe_eval_tasks
 import torch
 import transformers
+from torch import Tensor, nn
 
 from .. import model_quantisation as M
 from . import core, fisher
+
+
+# Quantisation Aware Training
+
+
+class XEnt_Destructive(torch.autograd.Function):
+    """A somewhat dangerous in-place Cross-Entropy, optimised for memory-efficiency.
+
+    Both forward and backward passes mutate `input_logits` in-place. It is unsafe for
+    `input_logits` to be consumed by any other operation.
+    """
+
+    @staticmethod
+    def forward(ctx, input_logits, target_p, mask):
+        input_logp = input_logits.sub_(torch.logsumexp(input_logits, -1, keepdim=True))
+        del input_logits
+        ctx.save_for_backward(input_logp, target_p, mask)
+        return torch.dot(target_p.flatten(), input_logp.flatten()).neg()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_logp, target_p, mask = ctx.saved_tensors
+        grad_input_logits = (
+            input_logp.exp_().sub_(target_p).mul_(mask).mul_(grad_output)
+        )
+        del input_logp
+        return grad_input_logits, None, None
+
+
+def compute_kl_loss(
+    model: nn.Module, reference_model: nn.Module, batch: dict[str, Tensor]
+) -> Tensor:
+    """Computes the KL divergence between the output of two models, with care for memory."""
+    with torch.no_grad():
+        reference_logp = torch.log_softmax(reference_model(**batch).logits, -1)
+        reference_p = reference_logp.exp().mul_(batch["attention_mask"].unsqueeze(-1))
+        # Calculate reference entropy here, so we can free up `reference_logp`
+        reference_ent = -torch.dot(reference_p.flatten(), reference_logp.flatten())
+        del reference_logp
+
+    xent = XEnt_Destructive.apply(
+        model(**batch).logits,
+        reference_p,
+        batch["attention_mask"].unsqueeze(-1),
+    )
+    return xent - reference_ent
+
+
+# Downstream Tasks
 
 
 @dataclass
@@ -25,7 +75,7 @@ TASKS = [
     Task(name=name, limit=d.get("limit"))
     for name, d in [
         # Selected cloze vs multiple-choice based on a baseline sweep
-        # (20250611-downstream-baselines)
+        # named "20250611-downstream-baselines"
         ("arc_challenge:mc", {}),
         ("arc_easy:mc", {}),
         ("boolq", {}),
@@ -63,6 +113,9 @@ def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
     return results
 
 
+# Top-level
+
+
 @dataclass
 class Run:
     experiment: str
@@ -72,7 +125,7 @@ class Run:
     bit_allocation: Literal["fixed", "variable"] = "fixed"
     error_weight: Literal[None, "fisher", "parameter"] = None
     device: torch.device = core.FIELD_DEVICE
-    type: str = "downstream"
+    type: str = "qat"
 
 
 class _Runner:
