@@ -1,16 +1,22 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
+import contextlib
+import copy
 import dataclasses
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Literal
 
+import datasets
 import oe_eval.models.eleuther_huggingface
 import oe_eval.run_eval
 import oe_eval.tasks.oe_eval_tasks
 import torch
+import torch.multiprocessing as multiprocessing
 import transformers
 from torch import Tensor, nn
+from torch.distributed import fsdp
 
 from .. import model_quantisation as M
 from . import core, fisher
@@ -60,6 +66,140 @@ def compute_kl_loss(
         batch["attention_mask"].unsqueeze(-1),
     )
     return xent - reference_ent
+
+
+@dataclass
+class Training:
+    lr: float
+    steps: int
+    sequence_length: int
+    batch_size: int
+    perturb_ratio: float
+    data_parallel: int = 1
+    compile: str | None = None
+    memory_profile: str | None = None
+    params_dtype: torch.dtype = torch.float32
+    compute_dtype: torch.dtype = torch.bfloat16
+    reference_dtype: torch.dtype = torch.bfloat16
+    dataset: str = "DKYoon/SlimPajama-6B"
+    adam_eps: float = 1e-5
+
+
+def _fully_shard_model(model: nn.Module, **args: Any) -> None:
+    fsdp.fully_shard(model.model.embed_tokens, **args)
+    for layer in model.model.layers:
+        fsdp.fully_shard(layer, **args)
+    fsdp.fully_shard(model.lm_head, **args)
+    fsdp.fully_shard(model, **args)
+
+
+def train(model_id: str, settings: Training) -> nn.Module:
+    with contextlib.ExitStack() as exit:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0 and settings.memory_profile:
+            exit.enter_context(core.cuda_memory_history(Path(settings.memory_profile)))
+
+        # Loading
+        reference_model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map=torch.get_default_device(),
+            torch_dtype=settings.reference_dtype,
+        )
+        model = copy.deepcopy(reference_model).to(settings.params_dtype)
+        tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
+        tokenizer.pad_token = tokenizer.eos_token
+        data = datasets.load_dataset("DKYoon/SlimPajama-6B")["train"]
+
+        # Modifying
+        for p in model.parameters():
+            if p.ndim == 2:
+                p.data += torch.randn_like(p).mul(p.std() * settings.perturb_ratio)
+
+        # Preparing
+        if torch.distributed.is_initialized():
+            assert settings.data_parallel == torch.distributed.get_world_size()
+            data = data.shard(
+                torch.distributed.get_world_size(), torch.distributed.get_rank()
+            )
+            _fully_shard_model(
+                model,
+                mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=settings.compute_dtype),
+            )
+        else:
+            assert settings.data_parallel == 1
+            assert settings.compute_dtype == settings.params_dtype
+            assert settings.params_dtype == settings.reference_dtype
+
+        exit.enter_context(fisher.activation_checkpointing_enabled(model))
+        if settings.compile:
+            reference_model = torch.compile(reference_model, mode=settings.compile)
+            model = torch.compile(model, mode=settings.compile)
+
+        # Training
+        opt = torch.optim.Adam(
+            model.parameters(),
+            lr=settings.lr,
+            eps=settings.adam_eps,
+        )
+        assert settings.batch_size % settings.data_parallel == 0
+        data_iter = data.iter(settings.batch_size // settings.data_parallel)
+        for step in range(settings.steps):
+            batch = tokenizer.batch_encode_plus(
+                next(data_iter)["text"],
+                return_tensors="pt",
+                padding="max_length",
+                max_length=settings.sequence_length,
+                truncation=True,
+            )
+            opt.zero_grad()
+            loss = compute_kl_loss(model, reference_model, batch)
+            loss.backward()
+            opt.step()
+            total_loss = loss.detach().div(batch.attention_mask.sum())
+            if settings.data_parallel:
+                torch.distributed.all_reduce(total_loss, torch.distributed.ReduceOp.AVG)
+            if rank == 0:
+                print(f"{step:>03}: {total_loss:.3f}")
+
+        # Returning
+        for m in model.modules():
+            if isinstance(m, fsdp.FSDPModule):
+                m.unshard()
+        return model
+
+
+def _train_worker(
+    world_size: int, rank: int, init_method: str, kwargs: dict[str, Any]
+) -> Any:
+    torch.distributed.init_process_group(
+        world_size=world_size, rank=rank, init_method=init_method
+    )
+    try:
+        device = torch.device("cuda", rank)
+        torch.cuda.set_device(device)
+        torch.set_default_device(device)
+        return train(**kwargs)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def run_train(model_id: str, settings: Training) -> nn.Module:
+    kwargs = dict(
+        world_size=settings.data_parallel,
+        init_method="tcp://localhost:10051",
+        kwargs=dict(model_id=model_id, settings=settings),
+    )
+    processes = [
+        multiprocessing.Process(target=_train_worker, kwargs=dict(rank=n, **kwargs))
+        for n in range(1, settings.data_parallel)
+    ]
+    for p in processes:
+        p.start()
+    try:
+        return _train_worker(rank=0, **kwargs)
+    finally:
+        for p in processes:
+            p.join()
 
 
 # Downstream Tasks
