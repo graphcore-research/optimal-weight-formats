@@ -229,7 +229,7 @@ class Dataset:
         )
         return dict(cross_entropy=xent, kl_div=kl_div)
 
-    def evaluate(self, model: transformers.PreTrainedModel) -> dict[str, float]:
+    def evaluate(self, model: transformers.PreTrainedModel) -> dict[str, Tensor]:
         with torch.no_grad():
             losses = [self.batch_losses(model, i) for i in range(self.n_batch)]
             return {k: torch.concat([x[k] for x in losses]) for k in losses[0]}

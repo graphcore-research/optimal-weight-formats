@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import dataclasses
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,8 +20,7 @@ from torch import Tensor, nn
 from torch.distributed import fsdp
 
 from .. import model_quantisation as M
-from . import core, fisher
-
+from . import core, fisher, token_prediction
 
 # Quantisation Aware Training
 
@@ -74,6 +74,8 @@ class Training:
     steps: int
     sequence_length: int
     batch_size: int
+    log_interval: int
+    valid_sequences: int
     perturb_ratio: float
     data_parallel: int = 1
     compile: str | None = None
@@ -93,7 +95,79 @@ def _fully_shard_model(model: nn.Module, **args: Any) -> None:
     fsdp.fully_shard(model, **args)
 
 
-def train(model_id: str, settings: Training) -> nn.Module:
+class _Logger:
+    def __init__(
+        self,
+        settings: Training,
+        rank: int,
+        experiment: core.Experiment | None,
+        valid_data: token_prediction.Dataset | None,
+        model: nn.Module,
+    ):
+        self.settings = settings
+        self.rank = rank
+        self.experiment = experiment
+        self.valid_data = valid_data
+        self.model = model
+
+        # State
+        self._step = 0
+        self._logged_step = 0
+        self._t0 = time.time()
+        self._total_loss = torch.tensor(0.0)
+        self._total_count = torch.tensor(0)
+        self._log = core.AttrDict(loss=[], duration=[])
+        self._validate_and_log()
+
+    def _validate_and_log(self) -> None:
+        # Compute statistics
+        if self.settings.data_parallel > 1:
+            torch.distributed.all_reduce(self._total_loss)
+            torch.distributed.all_reduce(self._total_count)
+        t1 = time.time()  # don't count validation
+        if self._step == self._logged_step:
+            self._log.loss.append(None)
+            self._log.duration.append(None)
+        else:
+            self._log.loss.append(self._total_loss.div(self._total_count).item())
+            self._log.duration.append(
+                (t1 - self._t0) / (self._step - self._logged_step)
+            )
+        if self.valid_data is not None:
+            for k, v in self.valid_data.evaluate(self.model).items():
+                self._log.setdefault(f"valid_{k}", []).append(v.mean().item())
+
+        # Write logs
+        if self.rank == 0:
+            print(
+                f"{self._step:>04}:  "
+                + "  ".join(
+                    f"{k}={v[-1]:.3f}"
+                    for k, v in self._log.items()
+                    if v[-1] is not None
+                ),
+                file=sys.stderr,
+            )
+        if self.experiment is not None:
+            self.experiment.summary(train=self._log)
+
+        # Reset
+        self._total_loss.zero_()
+        self._total_count.zero_()
+        self._t0 = time.time()
+        self._logged_step = self._step
+
+    def log(self, loss: Tensor, count: Tensor) -> None:
+        self._total_loss.add_(loss.float())
+        self._total_count.add_(count)
+        self._step += 1
+        if self._step % self.settings.log_interval == 0:
+            self._validate_and_log()
+
+
+def train(
+    model_id: str, settings: Training, experiment: core.Experiment | None
+) -> nn.Module:
     with contextlib.ExitStack() as exit:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if rank == 0 and settings.memory_profile:
@@ -109,6 +183,17 @@ def train(model_id: str, settings: Training) -> nn.Module:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
         tokenizer.pad_token = tokenizer.eos_token
         data = datasets.load_dataset("DKYoon/SlimPajama-6B")["train"]
+        valid_data = (
+            token_prediction.Dataset.load(
+                reference_model,
+                sequence_length=4096,
+                batch_size=1,
+                kl_topk=128,
+                sequence_limit=settings.valid_sequences,
+            )
+            if settings.valid_sequences
+            else None
+        )
 
         # Modifying
         for p in model.parameters():
@@ -143,7 +228,14 @@ def train(model_id: str, settings: Training) -> nn.Module:
         )
         assert settings.batch_size % settings.data_parallel == 0
         data_iter = data.iter(settings.batch_size // settings.data_parallel)
-        for step in range(settings.steps):
+        logger = _Logger(
+            settings,
+            rank=rank,
+            experiment=experiment,
+            valid_data=valid_data,
+            model=model,
+        )
+        for _ in range(settings.steps):
             batch = tokenizer.batch_encode_plus(
                 next(data_iter)["text"],
                 return_tensors="pt",
@@ -155,11 +247,7 @@ def train(model_id: str, settings: Training) -> nn.Module:
             loss = compute_kl_loss(model, reference_model, batch)
             loss.backward()
             opt.step()
-            total_loss = loss.detach().div(batch.attention_mask.sum())
-            if settings.data_parallel:
-                torch.distributed.all_reduce(total_loss, torch.distributed.ReduceOp.AVG)
-            if rank == 0:
-                print(f"{step:>03}: {total_loss:.3f}")
+            logger.log(loss.float(), batch.attention_mask.sum())
 
         # Returning
         for m in model.modules():
@@ -178,16 +266,20 @@ def _train_worker(
         device = torch.device("cuda", rank)
         torch.cuda.set_device(device)
         torch.set_default_device(device)
+        transformers.utils.logging.disable_progress_bar()
+        datasets.utils.logging.disable_progress_bar()
         return train(**kwargs)
     finally:
         torch.distributed.destroy_process_group()
 
 
-def run_train(model_id: str, settings: Training) -> nn.Module:
+def run_train(
+    model_id: str, settings: Training, experiment: core.Experiment | None
+) -> nn.Module:
     kwargs = dict(
         world_size=settings.data_parallel,
         init_method="tcp://localhost:10051",
-        kwargs=dict(model_id=model_id, settings=settings),
+        kwargs=dict(model_id=model_id, settings=settings, experiment=experiment),
     )
     processes = [
         multiprocessing.Process(target=_train_worker, kwargs=dict(rank=n, **kwargs))
