@@ -3,11 +3,12 @@
 import contextlib
 import copy
 import dataclasses
+import math
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, TypeAlias
 
 import datasets
 import oe_eval.models.eleuther_huggingface
@@ -68,6 +69,9 @@ def compute_kl_loss(
     return xent - reference_ent
 
 
+LRSchedule: TypeAlias = Literal["constant", "cosine", "linear"]
+
+
 @dataclass
 class Training:
     lr: float
@@ -77,6 +81,7 @@ class Training:
     log_interval: int
     valid_sequences: int
     perturb_ratio: float
+    lr_schedule: LRSchedule = "constant"
     data_parallel: int = 1
     compile: str | None = None
     memory_profile: str | None = None
@@ -165,6 +170,16 @@ class _Logger:
             self._validate_and_log()
 
 
+def lr_schedule_fn(name: LRSchedule, steps: int) -> Callable[[int], float]:
+    if name == "constant":
+        return lambda _: 1.0
+    if name == "linear":
+        return lambda n: 1 - n / steps
+    if name == "cosine":
+        return lambda n: 0.5 * (math.cos(math.pi * n / steps) + 1)
+    raise ValueError(f"Unexpected schedule {name!r}")
+
+
 def train(
     model_id: str, settings: Training, experiment: core.Experiment | None
 ) -> nn.Module:
@@ -223,8 +238,11 @@ def train(
         # Training
         opt = torch.optim.Adam(
             model.parameters(),
-            lr=settings.lr,
+            lr=torch.tensor(settings.lr),
             eps=settings.adam_eps,
+        )
+        schedule = torch.optim.lr_scheduler.LambdaLR(
+            opt, lr_schedule_fn(settings.lr_schedule, settings.steps)
         )
         assert settings.batch_size % settings.data_parallel == 0
         data_iter = data.iter(settings.batch_size // settings.data_parallel)
@@ -247,6 +265,7 @@ def train(
             loss = compute_kl_loss(model, reference_model, batch)
             loss.backward()
             opt.step()
+            schedule.step()
             logger.log(loss.float(), batch.attention_mask.sum())
 
         # Returning
@@ -256,39 +275,48 @@ def train(
         return model
 
 
-def _train_worker(
-    world_size: int, rank: int, init_method: str, kwargs: dict[str, Any]
-) -> Any:
-    torch.distributed.init_process_group(
-        world_size=world_size, rank=rank, init_method=init_method
-    )
+@contextlib.contextmanager
+def init_distributed(**args: Any) -> Iterable[None]:
+    torch.distributed.init_process_group(**args)
     try:
-        device = torch.device("cuda", rank)
+        device = torch.device("cuda", torch.distributed.get_rank())
         torch.cuda.set_device(device)
         torch.set_default_device(device)
         transformers.utils.logging.disable_progress_bar()
         datasets.utils.logging.disable_progress_bar()
-        return train(**kwargs)
+        yield
     finally:
         torch.distributed.destroy_process_group()
+
+
+def _train_worker(dist_kwargs: dict[str, Any], train_kwargs: dict[str, Any]) -> Any:
+    with init_distributed(**dist_kwargs):
+        return train(**train_kwargs)
 
 
 def run_train(
     model_id: str, settings: Training, experiment: core.Experiment | None
 ) -> nn.Module:
-    kwargs = dict(
-        world_size=settings.data_parallel,
-        init_method="tcp://localhost:10051",
-        kwargs=dict(model_id=model_id, settings=settings, experiment=experiment),
+    port = torch.randint(10000, 20000, ()).item()
+    dist_kwargs = dict(
+        world_size=settings.data_parallel, init_method=f"tcp://localhost:{port}"
     )
+    train_kwargs = dict(model_id=model_id, settings=settings, experiment=experiment)
     processes = [
-        multiprocessing.Process(target=_train_worker, kwargs=dict(rank=n, **kwargs))
+        multiprocessing.Process(
+            target=_train_worker,
+            kwargs=dict(
+                dist_kwargs=dict(rank=n, **dist_kwargs), train_kwargs=train_kwargs
+            ),
+        )
         for n in range(1, settings.data_parallel)
     ]
     for p in processes:
         p.start()
     try:
-        return _train_worker(rank=0, **kwargs)
+        return _train_worker(
+            dist_kwargs=dict(rank=0, **dist_kwargs), train_kwargs=train_kwargs
+        )
     finally:
         for p in processes:
             p.join()
