@@ -89,7 +89,9 @@ class Training:
     compute_dtype: torch.dtype = torch.bfloat16
     reference_dtype: torch.dtype = torch.bfloat16
     dataset: str = "DKYoon/SlimPajama-6B"
+    adam_betas: tuple[float, float] = (0.9, 0.999)
     adam_eps: float = 1e-5
+    weight_decay: float = 0.0
 
 
 def _fully_shard_model(model: nn.Module, **args: Any) -> None:
@@ -236,10 +238,12 @@ def train(
             model = torch.compile(model, mode=settings.compile)
 
         # Training
-        opt = torch.optim.Adam(
+        opt = torch.optim.AdamW(
             model.parameters(),
             lr=torch.tensor(settings.lr),
+            betas=settings.adam_betas,
             eps=settings.adam_eps,
+            weight_decay=settings.weight_decay,
         )
         schedule = torch.optim.lr_scheduler.LambdaLR(
             opt, lr_schedule_fn(settings.lr_schedule, settings.steps)
