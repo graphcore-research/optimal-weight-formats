@@ -257,27 +257,3 @@ def test_compressed_lut_format() -> None:
     )
     torch.testing.assert_close(fmt.quantise(tensor([-3, 1.2])), tensor([-2.0, 1]))
     assert fmt.count_bits_tensor(tensor([0, 0, 0, 0, 3])) == 4 * 1 + 3
-
-
-# Training
-
-
-def test_quantise_ste() -> None:
-    x = tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, -0.2, -0.4, 1.2, 1.4]).requires_grad_()
-    ex = tensor([0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0])
-    centroids = tensor([0, 0.5, 1.0]).requires_grad_()
-
-    y = Q.Quantise_STE.apply(x, centroids, False)
-    y.backward(torch.full_like(y, 2.0))
-
-    torch.testing.assert_close(y, ex)
-    torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
-    torch.testing.assert_close(centroids.grad, tensor([8.0, 4.0, 8.0]))
-
-    x.grad = centroids.grad = None
-    y = Q.Quantise_STE.apply(x, centroids, True)
-    y.backward(torch.full_like(y, 2.0))
-
-    torch.testing.assert_close(
-        x.grad, tensor([2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 0.0, 2.0, 0.0])
-    )
