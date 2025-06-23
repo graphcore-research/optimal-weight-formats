@@ -45,10 +45,13 @@ def test_fp_format(dtype: torch.dtype) -> None:
     assert e2m1.min_absolute_normal == 0.5
     assert e2m1.min_absolute_subnormal == 0.25
     for fmt, limit, steps, expected in [
-        (Q.parse("E2M1"), 4, 100, {0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3}),
-        (Q.parse("E3M0"), 10, 1000, {0, 0.125, 0.25, 0.5, 1, 2, 4, 8}),
-        (Q.parse("E2M0"), 10, 1000, {0, 0.5, 1, 2}),
+        (Q.parse("E2M1"), 4, 100, [0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3]),
+        (Q.parse("E3M0"), 10, 1000, [0, 0.125, 0.25, 0.5, 1, 2, 4, 8]),
+        (Q.parse("E2M0"), 10, 1000, [0, 0.5, 1, 2]),
     ]:
+        assert fmt.centroids == tuple(
+            [-e for e in expected[1:][::-1]] + [0] + expected[1:]
+        )
         x = torch.linspace(-limit, limit, steps=steps, dtype=dtype)
         y = fmt.quantise(x)
         assert y.dtype == dtype
@@ -57,16 +60,9 @@ def test_fp_format(dtype: torch.dtype) -> None:
     ue2m1 = Q.parse("UE2M1")
     assert ue2m1.bits == 3
     assert ue2m1.range == (0, 3)
-    assert set(ue2m1.quantise(torch.linspace(-4, 4, 100)).tolist()) == {
-        0,
-        0.25,
-        0.5,
-        0.75,
-        1,
-        1.5,
-        2,
-        3,
-    }
+    expected = [0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3]
+    assert ue2m1.centroids == tuple(expected)
+    assert set(ue2m1.quantise(torch.linspace(-4, 4, 100)).tolist()) == set(expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -84,29 +80,25 @@ def test_int_format() -> None:
     fmt = Q.IntFormat(log2(8))
     assert str(fmt) == "E0M2"
     assert fmt.range == (-4, 3)
+    assert fmt.centroids == tuple(range(-4, 3 + 1))
     assert set(fmt.quantise(x).tolist()) == set(range(-4, 3 + 1))
     assert fmt.count_bits((100,)) == 100 * 3
 
     fmt = Q.IntFormat(log2(9))
     assert fmt.range == (-4, 4)
+    assert fmt.centroids == tuple(range(-4, 4 + 1))
     assert set(fmt.quantise(x).tolist()) == set(range(-4, 4 + 1))
 
     fmt = Q.IntFormat(log2(8), mode="symmetric")
     assert str(fmt) == "E0M2-S"
     assert fmt.range == (-3.5, 3.5)
-    assert sorted(set(fmt.quantise(x).tolist())) == [
-        -3.5,
-        -2.5,
-        -1.5,
-        -0.5,
-        0.5,
-        1.5,
-        2.5,
-        3.5,
-    ]
+    expected = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
+    assert fmt.centroids == tuple(expected)
+    assert sorted(set(fmt.quantise(x).tolist())) == expected
 
     fmt = Q.IntFormat(log2(9), mode="symmetric")  # already symmetric
     assert fmt.range == (-4, 4)
+    assert fmt.centroids == tuple(range(-4, 4 + 1))
     assert set(fmt.quantise(x).tolist()) == set(range(-4, 4 + 1))
 
 
@@ -121,10 +113,13 @@ def test_torch_format() -> None:
 
 
 def test_exp_ceil_format() -> None:
-    fmt = Q.parse("EXP8")
-    amax = 2 ** (2**7)
-    assert fmt.bits == 8
+    fmt = Q.parse("EXP6")
+    amax = 2 ** (2**5)
+    assert fmt.bits == 6
     assert fmt.range == (2 / amax, amax)
+    torch.testing.assert_close(
+        tensor(fmt.centroids).log2(), torch.arange(-31, 32 + 1).float()
+    )
     # Always round up
     assert torch.equal(
         fmt.quantise(tensor([1.01 / amax, 2.000001, amax * 1.01], dtype=torch.float64)),
@@ -137,6 +132,7 @@ def test_lut_format() -> None:
     assert str(fmt) == "LUT2[fours]"
     assert fmt.bits == 2
     assert fmt.range == (-1, 1)
+    assert fmt.centroids == (-1, -0.125, 0.125, 1)
     assert torch.equal(
         fmt.quantise(tensor([0.8, 0.6, -0.001, -1.2])),
         tensor([1, 1, -0.125, -1]),
@@ -177,6 +173,12 @@ def test_scalar_formats() -> None:
         assert qx.shape == x.shape
         assert torch.all(fmt.range[0] <= qx)
         assert torch.all(qx <= fmt.range[1])
+        if not isinstance(fmt, Q.TorchFormat):
+            centroids = tensor(fmt.centroids).float()
+            closest = centroids[
+                torch.bucketize(qx, (centroids[1:] + centroids[:-1]) / 2)
+            ]
+            torch.testing.assert_close(qx, closest)
 
         assert _json_roundtrip(fmt) == fmt
 
@@ -200,6 +202,16 @@ def test_lloyd_max_crd() -> None:
 
 
 # Wrappers
+
+
+def test_scaled_format() -> None:
+    fmt = Q.ScaledFormat.create(Q.LUTFormat.create((-1, -0.25, 0.25, 1), "fours"), 0.5)
+    torch.testing.assert_close(fmt.quantise(tensor([0.1, -1])), tensor([0.125, -0.5]))
+    assert fmt.centroids == (-0.5, -0.125, 0.125, 0.5)
+    assert fmt.range == (-0.5, 0.5)
+
+    fmt_clip = Q.ScaledFormat.create(fmt.format, 0.5, (-1, 1))
+    assert fmt_clip.range == (-1, 1)
 
 
 def test_random_rotation_format() -> None:

@@ -2,22 +2,13 @@
 
 """Utilities for "fake quantisation"."""
 
+import builtins
 import bz2
 import itertools as it
 import math
 import re
 from dataclasses import dataclass
-from typing import (
-    Any,
-    Callable,
-    Iterable,
-    Literal,
-    Optional,
-    Tuple,
-    TypeAlias,
-    Union,
-    cast,
-)
+from typing import Any, Callable, Literal, Optional, Tuple, TypeAlias, Union, cast
 
 import scipy.stats
 import torch
@@ -84,7 +75,7 @@ class TensorFormat:
 class ScalarFormat(TensorFormat):
     """Elementwise scalar formats (abstract base class).
 
-    Subclasses define: `_type`, `__str__`, `bits`, `range`, `quantise`
+    Subclasses define: `_type`, `__str__`, `bits`, `range`, `centroids`, `quantise`
     """
 
     def __str__(self) -> str:
@@ -96,6 +87,10 @@ class ScalarFormat(TensorFormat):
 
     @property
     def range(self) -> tuple[float, float]:
+        raise NotImplementedError
+
+    @property
+    def centroids(self) -> tuple[float, ...]:
         raise NotImplementedError
 
     def count_bits(self, shape: Shape) -> int:
@@ -149,6 +144,21 @@ class FPFormat(ScalarFormat):
         max_exponent = 2 ** (self.exponent_bits - 1) - 1
         absmax = cast(float, 2**max_exponent * (2 - 2**-self.mantissa_bits))
         return (self.signed * -absmax, absmax)
+
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        ebias = 2 ** (self.exponent_bits - 1)
+        n_mantissa = 2**self.mantissa_bits
+        positive_values = tuple(
+            2 ** (e - ebias + (e == 0)) * ((e > 0) + m / n_mantissa)
+            for e in range(2**self.exponent_bits)
+            for m in range(n_mantissa)
+        )[1:]
+        if self.signed:
+            return (
+                tuple(-p for p in reversed(positive_values)) + (0.0,) + positive_values
+            )
+        return (0.0,) + positive_values
 
     @property
     def min_absolute_normal(self) -> float:
@@ -229,6 +239,14 @@ class TorchFormat(ScalarFormat):
         )
         return (info.min, info.max)
 
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        raise NotImplementedError(
+            "TorchFormat does not implement `centroids`."
+            " Note that the set of centroids is often too large"
+            " for practical use."
+        )
+
 
 @dataclass
 class IntFormat(ScalarFormat):
@@ -261,6 +279,11 @@ class IntFormat(ScalarFormat):
         )
         return (-half_range - (2 * half_range + 1 < n_values), half_range)
 
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        n_values = int(round(2.0**self.bits_))
+        return tuple(torch.linspace(*self.range, n_values).tolist())
+
     def quantise(self, x: Tensor) -> Tensor:
         n_values = int(round(2.0**self.bits_))
         offset = 0.5 if n_values % 2 == 0 and self.mode == "symmetric" else 0
@@ -287,6 +310,11 @@ class ExpCeilFormat(ScalarFormat):
             cast(float, 2 ** (-self.exponent_bias)),
             cast(float, 2 ** (2**self.bits_ - 1 - self.exponent_bias)),
         )
+
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        bias = int(self.exponent_bias)
+        return tuple(2**n for n in range(-bias, int(2**self.bits_ - bias)))
 
     @property
     def exponent_bias(self) -> float:
@@ -328,6 +356,10 @@ class LUTFormat(ScalarFormat):
     @property
     def range(self) -> tuple[float, float]:
         return self._range
+
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        return self.values
 
     @property
     def bits(self) -> float:
@@ -805,6 +837,10 @@ class ScaledFormat(ScalarFormat):
     def range(self) -> tuple[float, float]:
         return self._range
 
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        return tuple(self.scale * c for c in self.format.centroids)
+
     def quantise(self, tensor: Tensor) -> Tensor:
         return self.format.quantise(tensor / self.scale) * self.scale
 
@@ -920,6 +956,62 @@ BlockShape = Tuple[Optional[int], ...]
 Scaling = Literal["absmax", "signmax", "rms"]
 
 
+def safe_div(a: Tensor, b: Tensor) -> Tensor:
+    """Division (r=a/b), or identity (r=a) when b == 0."""
+    return a / torch.where(b == 0, 1, b)
+
+
+def blocked_shape(tensor: Tensor, block_shape: BlockShape) -> Tensor:
+    """Reshapes `tensor` into a double-rank version of (n_blocks, block_size) pairs."""
+    if tensor.ndim != len(block_shape):
+        raise ValueError(
+            f"blocked_shape tensor shape {tuple(tensor.shape)}"
+            f" must be the same rank as block_shape {block_shape}"
+        )
+    return tuple(
+        s
+        for si, bi in zip(tensor.shape, block_shape)
+        for s in ((1, si) if bi is None else (si // bi, bi))
+    )
+
+
+def blocked_scale(
+    block_tensor: Tensor, scaling: Scaling, element_range: tuple[float, float]
+) -> Tensor:
+    """Reduce over odd dimensions (1, 3, ...) to get the scale."""
+    block_dims = tuple(range(1, block_tensor.ndim, 2))
+    eps = torch.finfo(block_tensor.dtype).smallest_normal
+    if scaling == "absmax":
+        element_absmax = min(-element_range[0], element_range[1])
+        return (
+            block_tensor.abs()
+            .amax(dim=block_dims, keepdim=True)
+            .div(element_absmax)
+            .clamp_min_(eps)
+        )
+    if scaling == "signmax":
+        element_signmax = (
+            element_range[0]
+            if -element_range[0] > element_range[1]
+            else element_range[1]
+        )
+        bmin = block_tensor.amin(dim=block_dims, keepdim=True).clamp_max_(-eps)
+        bmax = block_tensor.amax(dim=block_dims, keepdim=True).clamp_min_(eps)
+        return torch.where(-bmin > bmax, bmin, bmax).div(element_signmax)
+    if scaling == "rms":
+        # Care is required here when everything in a block is small but non-zero,
+        # so that the RMS underflows. We need to clamp_min_ before sqrt() to avoid
+        # NaN or exploding values.
+        return (
+            block_tensor.pow(2)
+            .mean(dim=block_dims, keepdim=True, dtype=torch.float32)
+            .clamp_min_(torch.finfo(torch.float32).smallest_normal)
+            .sqrt()
+            .to(block_tensor.dtype)
+        )
+    assert False, f"unexpected scaling={scaling}"
+
+
 def block_normalise(
     tensor: Tensor,
     block_shape: BlockShape,
@@ -929,58 +1021,11 @@ def block_normalise(
 ) -> tuple[Tensor, Tensor]:
     """Normalise the tensor, returning the normalised tensor & scale."""
 
-    if tensor.ndim != len(block_shape):
-        raise ValueError(
-            f"block_normalise tensor shape {tuple(tensor.shape)}"
-            f" must be the same rank as block_shape {block_shape}"
-        )
-
-    def _get_scale(block_tensor: Tensor) -> Tensor:
-        """Reduce over odd dimensions (1, 3, ...) to get the scale."""
-        block_dims = tuple(range(1, block_tensor.ndim, 2))
-        eps = torch.finfo(block_tensor.dtype).smallest_normal
-        if scaling == "absmax":
-            element_absmax = min(-element_range[0], element_range[1])
-            return (
-                block_tensor.abs()
-                .amax(dim=block_dims, keepdim=True)
-                .div(element_absmax)
-                .clamp_min_(eps)
-            )
-        if scaling == "signmax":
-            element_signmax = (
-                element_range[0]
-                if -element_range[0] > element_range[1]
-                else element_range[1]
-            )
-            bmin = block_tensor.amin(dim=block_dims, keepdim=True).clamp_max_(-eps)
-            bmax = block_tensor.amax(dim=block_dims, keepdim=True).clamp_min_(eps)
-            return torch.where(-bmin > bmax, bmin, bmax).div(element_signmax)
-        if scaling == "rms":
-            # Care is required here when everything in a block is small but non-zero,
-            # so that the RMS underflows. We need to clamp_min_ before sqrt() to avoid
-            # NaN or exploding values.
-            return (
-                block_tensor.pow(2)
-                .mean(dim=block_dims, keepdim=True, dtype=torch.float32)
-                .clamp_min_(torch.finfo(torch.float32).smallest_normal)
-                .sqrt()
-                .to(block_tensor.dtype)
-            )
-        assert False, f"unexpected scaling={scaling}"
-
-    blocked_shape = tuple(
-        s
-        for si, bi in zip(tensor.shape, block_shape)
-        for s in ((1, si) if bi is None else (si // bi, bi))
-    )
-    scale = scale_format.quantise(
-        _get_scale(tensor.reshape(blocked_shape))
-        .broadcast_to(blocked_shape)
-        .reshape(tensor.shape)
-    )
-    scale = torch.where(scale == 0, 1, scale)  # protect against /0
-    return tensor / scale, scale
+    block_tensor = tensor.reshape(blocked_shape(tensor, block_shape))
+    scale = blocked_scale(block_tensor, scaling, element_range)
+    scale = scale.broadcast_to(block_tensor.shape).reshape(tensor.shape)
+    scale = scale_format.quantise(scale)
+    return safe_div(tensor, scale), scale
 
 
 @dataclass
@@ -1077,28 +1122,45 @@ class CompressedLUTFormat(CompressedTensorFormat):
     def range(self) -> tuple[float, float]:
         return self.lut.range
 
+    @property
+    def centroids(self) -> tuple[float, ...]:
+        return self.lut.centroids
+
     def quantise(self, tensor: Tensor) -> Tensor:
         return self.lut.quantise(tensor)
 
-    def count_bits_tensor(self, tensor: Tensor) -> float:
-        idx = self.lut.to_idx(tensor)
+    @staticmethod
+    def count_bits_compressed(
+        tensor: Tensor,
+        lut: LUTFormat,
+        compressor: Compressor,
+        model_logp: Tensor | None,
+    ) -> float:
+        idx = lut.to_idx(tensor)
+        if model_logp is None:
+            model_logp = (
+                torch.bincount(idx.flatten(), minlength=len(lut.values))
+                .float()
+                .div_(tensor.nelement())
+                .log_()
+            )
 
-        if self.compressor == "optimal":
+        if compressor == "optimal":
             log2 = torch.tensor(2, device=tensor.device, dtype=tensor.dtype).log()
-            return -self.model_logp[idx].sum().div(log2).item()
+            return -model_logp[idx].sum().div(log2).item()
 
-        if self.compressor == "bz2":
+        if compressor == "bz2":
             idx_bytes = idx.to(torch.uint32).cpu().numpy().tobytes()
             return len(bz2.compress(idx_bytes)) * 8
 
-        if self.compressor == "huffman":
+        if compressor == "huffman":
             # We don't count the bits to encode the table, since it's considered
             # fixed (derived from `model_logp` not `tensor`).
             import dahuffman
 
             # Note: use freq = p * large-const, since EOF is added with freq=1
             codec = dahuffman.HuffmanCodec.from_frequencies(
-                {i: p.exp().item() * 2**20 for i, p in enumerate(self.model_logp)}
+                {i: p.exp().item() * 2**20 for i, p in enumerate(model_logp)}
             )
             # Instead of actually encoding the data, which is very slow, encode test
             # sequences to work out the number of bits per item and index into that.
@@ -1107,29 +1169,31 @@ class CompressedLUTFormat(CompressedTensorFormat):
             nbits = torch.tensor(
                 [
                     8 * len(codec.encode([i] * n_samples)) / n_samples
-                    for i in range(len(self.model_logp))
+                    for i in range(len(model_logp))
                 ],
                 device=idx.device,
             )
             return nbits[idx].sum().item()
 
-        if self.compressor == "arithmetic":
+        if compressor == "arithmetic":
             import arithmetic_compressor
 
             # Clip the minimum probability to avoid numerical issues (empirical threshold)
             codec = arithmetic_compressor.AECompressor(
                 arithmetic_compressor.models.StaticModel(
-                    {
-                        i: p.exp().clip(min=2e-4).item()
-                        for i, p in enumerate(self.model_logp)
-                    }
+                    {i: p.exp().clip(min=2e-4).item() for i, p in enumerate(model_logp)}
                 )
             )
             # We don't count the bits to encode the table, since it's considered
             # fixed (derived from `model_logp` not `tensor`).
             return len(codec.compress(idx.cpu().numpy()))  # list of bits
 
-        raise ValueError(f"Unknown compressor {self.compressor!r}")
+        raise ValueError(f"Unknown compressor {compressor!r}")
+
+    def count_bits_tensor(self, tensor: Tensor) -> float:
+        return self.count_bits_compressed(
+            tensor, self.lut, self.compressor, self.model_logp
+        )
 
     @classmethod
     def train(
