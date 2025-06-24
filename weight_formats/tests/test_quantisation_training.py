@@ -1,11 +1,13 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
-import torch
-from torch import tensor
+import copy
 
-from .. import quantisation_training as T
+import torch
+from torch import nn, tensor
+
 from .. import fit as F
 from .. import quantisation as Q
+from .. import quantisation_training as T
 
 
 def test_quantise_ste() -> None:
@@ -112,3 +114,54 @@ def test_weight_gradients() -> None:
     assert weight.scale.grad.ne(0).any(), "hard to predict scale.grad"
     assert weight.centroids.grad.ne(0).all()
     assert weight.sparse_weight.grad.equal(torch.full((3,), 1.0))
+
+
+def test_convert_and_train() -> None:
+    torch.manual_seed(100)
+    reference = nn.Sequential(
+        nn.Linear(64, 512, bias=False),
+        nn.RMSNorm((512,)),
+        nn.Linear(512, 64, bias=False),
+    )
+    input = torch.randn(2048, 64)
+    with torch.no_grad():
+        reference_out = reference(input)
+
+    model = copy.deepcopy(reference)
+    T.convert(
+        model,
+        F.Scaled(
+            element_bits=3,
+            element_family="int",
+            scale_format=Q.BFLOAT16,
+            block_shape=(1, 64),
+            scaling="absmax",
+            scaling_match="moments",
+            sparse_format=Q.BFLOAT16,
+            sparse_ratio=1e-3,
+        ),
+        scaling_mode="parameter",
+        clip_gradient=True,
+    )
+
+    bpp = T.count_bits(model) / sum(p.nelement() for p in model.parameters())
+    assert 3.25 < bpp < 4
+
+    opt = torch.optim.Adam(
+        [
+            dict(params=T.get_named_parameters(model, "weight"), lr=1e-4),
+            dict(params=T.get_named_parameters(model, "scale"), lr=1e-4),
+            dict(params=T.get_named_parameters(model, "centroids"), lr=0),
+            dict(params=T.get_named_parameters(model, "other"), lr=0),
+        ],
+        lr=0,
+        betas=(0.9, 0.9),
+    )
+    losses = []
+    for _ in range(10):
+        opt.zero_grad()
+        loss = (model(input) - reference_out).pow(2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0] * 0.75

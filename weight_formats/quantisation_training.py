@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from . import quantisation as Q
+from . import fit as F
 
 
 class Quantise_STE(torch.autograd.Function):
@@ -36,10 +37,15 @@ class Quantise_STE(torch.autograd.Function):
         if not centroids.requires_grad:
             gcentroids = None
         else:
+            # We found that `index_add_` is hundreds of times slower in bfloat16
+            # (torch 2.6.0), and also likely to be inaccurate, so perform this
+            # operation in float32
+            gcentroids = torch.zeros_like(centroids, dtype=torch.float32)
             boundaries = (centroids[1:] + centroids[:-1]) / 2
-            gcentroids = torch.zeros_like(centroids).index_add_(
-                0, torch.bucketize(x, boundaries).flatten(), gy.flatten()
+            gcentroids.index_add_(
+                0, torch.bucketize(x, boundaries).flatten(), gy.flatten().float()
             )
+            gcentroids = gcentroids.to(centroids.dtype)
 
         return (gx, gcentroids, None)
 
@@ -121,6 +127,10 @@ class Weight(nn.Module):
             self.compressor = scaling_fmt.element_format.compressor
 
     @property
+    def shape(self) -> torch.Size:
+        return self.master.shape
+
+    @property
     def bits(self) -> float:
         """Bit count; note: only counts `centroids` if trainable."""
         # For `master` (after scaling and quantisation)
@@ -179,6 +189,9 @@ class Weight(nn.Module):
             weight = weight.reshape(self.master.shape)
         return weight
 
+    def extra_repr(self) -> str:
+        return ", ".join(map(str, self.shape))
+
 
 class Linear(nn.Module):
     def __init__(self, weight: Weight):
@@ -196,3 +209,91 @@ class Embedding(nn.Module):
 
     def forward(self, input: Tensor) -> Tensor:
         return nn.functional.embedding(input, self.weight())
+
+
+def convert(
+    module: nn.Module,
+    fmt_spec: F.Scaled | Q.TensorFormat | dict[str, F.Scaled | Q.TensorFormat],
+    scaling_mode: ScalingMode,
+    clip_gradient: bool,
+) -> None:
+    """Recursively convert `module` to a trainable quantised model."""
+
+    shared_weights = {}
+    with torch.no_grad():
+        for parent_name, parent in module.named_modules():
+            for name, child in parent.named_children():
+                replace_cls = None
+                if isinstance(child, nn.Linear):
+                    if type(child) != nn.Linear or child.bias is not None:
+                        raise ValueError(
+                            f"Cannot convert {type(child)}(bias={child.bias is not None})"
+                        )
+                    replace_cls = Linear
+
+                if isinstance(child, nn.Embedding):
+                    if type(child) != nn.Embedding or not (
+                        child.padding_idx is None and child.max_norm is None
+                    ):
+                        raise ValueError(
+                            f"Cannot convert {type(child)}(padding_idx={child.padding_idx}"
+                            f", max_norm={child.max_norm})"
+                        )
+                    replace_cls = Embedding
+
+                if replace_cls:
+                    if child.weight not in shared_weights:
+                        pname = ".".join(
+                            filter(None, parent_name.split(".") + [name, "weight"])
+                        )
+                        pspec = (
+                            fmt_spec[pname] if isinstance(fmt_spec, dict) else fmt_spec
+                        )
+                        fmt = (
+                            pspec.fit(child.weight)
+                            if isinstance(pspec, F.Scaled)
+                            else pspec
+                        )
+                        shared_weights[child.weight] = Weight(
+                            child.weight, fmt, scaling_mode, clip_gradient
+                        )
+                    parent.add_module(name, replace_cls(shared_weights[child.weight]))
+
+
+def get_named_parameters(
+    module: nn.Module, kind: Literal["weight", "scale", "centroids", "other"]
+) -> list[tuple[str, nn.Parameter]]:
+    """Extract a non-overlapping partition of parameters.
+
+    "weight" -- all QAT-trainable weights (`master` and `sparse_weight`)
+    "scale" -- trainable scales (when `scaling_mode = "parameter"`)
+    "centroids" -- trainable centroids
+    "other" -- non-QAT weights (e.g. norms)
+    """
+    results = []
+    for mname, m in module.named_modules():
+        if isinstance(m, Weight):
+            for n, p in m._parameters.items():
+                pkind = dict(
+                    master="weight",
+                    sparse_weight="weight",
+                    scale="scale",
+                    centroids="centroids",
+                )[n]
+                if kind == pkind:
+                    results.append((f"{mname}.{n}", p))
+        elif kind == "other":
+            results.extend((f"{mname}.{n}", p) for n, p in m._parameters.items())
+    return results
+
+
+def count_bits(module: nn.Module, include_other: bool = True) -> float:
+    """Count total QAT-trainable and (by default) unquantised parameter bits."""
+    total = 0
+    for m in module.modules():
+        if isinstance(m, Weight):
+            total += m.bits
+        elif include_other:
+            for p in m._parameters.values():
+                total += p.nelement() * p.itemsize * 8
+    return total

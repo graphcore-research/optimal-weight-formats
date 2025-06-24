@@ -23,7 +23,32 @@ from torch.distributed import fsdp
 from .. import model_quantisation as M
 from . import core, fisher, token_prediction
 
-# Quantisation Aware Training
+
+# Quantisation-Aware Training
+
+LRSchedule: TypeAlias = Literal["constant", "cosine", "linear"]
+
+
+@dataclass
+class Training:
+    lr: float
+    steps: int
+    sequence_length: int
+    batch_size: int
+    log_interval: int
+    valid_sequences: int
+    perturb_ratio: float
+    lr_schedule: LRSchedule = "constant"
+    data_parallel: int = 1
+    compile: str | None = None
+    params_dtype: torch.dtype = torch.float32
+    compute_dtype: torch.dtype = torch.bfloat16
+    reference_dtype: torch.dtype = torch.bfloat16
+    adam_betas: tuple[float, float] = (0.9, 0.9)
+    adam_eps: float = 1e-5
+    weight_decay: float = 0.0
+    dataset: str = "DKYoon/SlimPajama-6B"
+    memory_profile: str | None = None
 
 
 class XEnt_Destructive(torch.autograd.Function):
@@ -69,31 +94,6 @@ def compute_kl_loss(
     return xent - reference_ent
 
 
-LRSchedule: TypeAlias = Literal["constant", "cosine", "linear"]
-
-
-@dataclass
-class Training:
-    lr: float
-    steps: int
-    sequence_length: int
-    batch_size: int
-    log_interval: int
-    valid_sequences: int
-    perturb_ratio: float
-    lr_schedule: LRSchedule = "constant"
-    data_parallel: int = 1
-    compile: str | None = None
-    memory_profile: str | None = None
-    params_dtype: torch.dtype = torch.float32
-    compute_dtype: torch.dtype = torch.bfloat16
-    reference_dtype: torch.dtype = torch.bfloat16
-    dataset: str = "DKYoon/SlimPajama-6B"
-    adam_betas: tuple[float, float] = (0.9, 0.999)
-    adam_eps: float = 1e-5
-    weight_decay: float = 0.0
-
-
 def _fully_shard_model(model: nn.Module, **args: Any) -> None:
     fsdp.fully_shard(model.model.embed_tokens, **args)
     for layer in model.model.layers:
@@ -102,17 +102,21 @@ def _fully_shard_model(model: nn.Module, **args: Any) -> None:
     fsdp.fully_shard(model, **args)
 
 
+def _is_master() -> bool:
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
 class _Logger:
     def __init__(
         self,
         settings: Training,
-        rank: int,
         experiment: core.Experiment | None,
         valid_data: token_prediction.Dataset | None,
         model: nn.Module,
     ):
         self.settings = settings
-        self.rank = rank
         self.experiment = experiment
         self.valid_data = valid_data
         self.model = model
@@ -145,7 +149,7 @@ class _Logger:
                 self._log.setdefault(f"valid_{k}", []).append(v.mean().item())
 
         # Write logs
-        if self.rank == 0:
+        if _is_master():
             print(
                 f"{self._step:>04}:  "
                 + "  ".join(
@@ -186,8 +190,7 @@ def train(
     model_id: str, settings: Training, experiment: core.Experiment | None
 ) -> nn.Module:
     with contextlib.ExitStack() as exit:
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        if rank == 0 and settings.memory_profile:
+        if _is_master() and settings.memory_profile:
             exit.enter_context(core.cuda_memory_history(Path(settings.memory_profile)))
 
         # Loading
@@ -252,7 +255,6 @@ def train(
         data_iter = data.iter(settings.batch_size // settings.data_parallel)
         logger = _Logger(
             settings,
-            rank=rank,
             experiment=experiment,
             valid_data=valid_data,
             model=model,
