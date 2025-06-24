@@ -2,14 +2,15 @@
 
 """Core utilities for quantisation-aware training."""
 
+import copy
 import math
 from typing import Literal, TypeAlias
 
 import torch
 from torch import Tensor, nn
 
-from . import quantisation as Q
 from . import fit as F
+from . import quantisation as Q
 
 
 class Quantise_STE(torch.autograd.Function):
@@ -130,9 +131,10 @@ class Weight(nn.Module):
     def shape(self) -> torch.Size:
         return self.master.shape
 
-    @property
-    def bits(self) -> float:
+    def count_bits(self, compute_dtype: torch.dtype) -> float:
         """Bit count; note: only counts `centroids` if trainable."""
+        compute_itemsize = compute_dtype.itemsize
+
         # For `master` (after scaling and quantisation)
         if hasattr(self, "compressor"):
             # Note: this MUST mirror forward()
@@ -150,18 +152,18 @@ class Weight(nn.Module):
 
         # For `scale`
         if self.scaling_mode == "parameter":
-            bits += self.scale.nelement() * self.scale.itemsize * 8
+            bits += self.scale.nelement() * compute_itemsize * 8
         else:
             bits += self._scale_format.count_bits(self._blocked_shape[::2])
 
         # For `sparse_idx`, `sparse_weight`
         if hasattr(self, "sparse_idx"):
             bits += self.sparse_idx.nelement() * 32  # assume representable in 32 bits
-            bits += self.sparse_weight.nelement() * self.sparse_weight.itemsize * 8
+            bits += self.sparse_weight.nelement() * compute_itemsize * 8
 
         # For `centroids`
         if self.centroids.requires_grad:
-            bits += self.centroids.nelement() * self.centroids.itemsize * 8
+            bits += self.centroids.nelement() * compute_itemsize * 8
 
         return bits
 
@@ -216,13 +218,14 @@ def convert(
     fmt_spec: F.Scaled | Q.TensorFormat | dict[str, F.Scaled | Q.TensorFormat],
     scaling_mode: ScalingMode,
     clip_gradient: bool,
+    error_weight: dict[str, Tensor] | None,
 ) -> None:
     """Recursively convert `module` to a trainable quantised model."""
 
     shared_weights = {}
     with torch.no_grad():
         for parent_name, parent in module.named_modules():
-            for name, child in parent.named_children():
+            for name, child in list(parent.named_children()):
                 replace_cls = None
                 if isinstance(child, nn.Linear):
                     if type(child) != nn.Linear or child.bias is not None:
@@ -242,7 +245,13 @@ def convert(
                     replace_cls = Embedding
 
                 if replace_cls:
-                    if child.weight not in shared_weights:
+                    if child.weight in shared_weights:
+                        # Copy the module, then share the parameters individually
+                        src = shared_weights[child.weight]
+                        weight = copy.deepcopy(weight)
+                        for k in src._parameters:
+                            setattr(weight, k, getattr(src, k))
+                    else:
                         pname = ".".join(
                             filter(None, parent_name.split(".") + [name, "weight"])
                         )
@@ -250,14 +259,17 @@ def convert(
                             fmt_spec[pname] if isinstance(fmt_spec, dict) else fmt_spec
                         )
                         fmt = (
-                            pspec.fit(child.weight)
+                            pspec.fit(
+                                child.weight,
+                                error_weight[name] if error_weight else None,
+                            )
                             if isinstance(pspec, F.Scaled)
                             else pspec
                         )
-                        shared_weights[child.weight] = Weight(
+                        weight = shared_weights[child.weight] = Weight(
                             child.weight, fmt, scaling_mode, clip_gradient
                         )
-                    parent.add_module(name, replace_cls(shared_weights[child.weight]))
+                    parent.add_module(name, replace_cls(weight))
 
 
 def get_named_parameters(
@@ -287,13 +299,37 @@ def get_named_parameters(
     return results
 
 
-def count_bits(module: nn.Module, include_other: bool = True) -> float:
+def count_bits(
+    module: nn.Module, compute_dtype: torch.dtype, include_other: bool = True
+) -> float:
     """Count total QAT-trainable and (by default) unquantised parameter bits."""
     total = 0
+    visited = set()
     for m in module.modules():
         if isinstance(m, Weight):
-            total += m.bits
-        elif include_other:
-            for p in m._parameters.values():
-                total += p.nelement() * p.itemsize * 8
+            if set(m.parameters()) - visited:
+                total += m.count_bits(compute_dtype)
+                visited |= set(m.parameters())
+    if include_other:
+        for p in module.parameters():
+            if p not in visited:
+                total += p.nelement() * compute_dtype.itemsize * 8
+                visited.add(p)
+    return total
+
+
+def count_parameters(module: nn.Module, include_other: bool = True) -> int:
+    """Count total QAT-trainable and (by default) unquantised parameters."""
+    total = 0
+    visited = set()
+    for m in module.modules():
+        if isinstance(m, Weight):
+            if set(m.parameters()) - visited:
+                total += math.prod(m.shape)
+                visited |= set(m.parameters())
+    if include_other:
+        for p in module.parameters():
+            if p not in visited:
+                total += p.nelement()
+                visited.add(p)
     return total

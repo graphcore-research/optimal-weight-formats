@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import dataclasses
+import itertools as it
 import math
 import sys
 import time
@@ -20,339 +21,130 @@ import transformers
 from torch import Tensor, nn
 from torch.distributed import fsdp
 
+from .. import fit as F
+from .. import quantisation_training as T
 from .. import model_quantisation as M
+from .. import quantisation as Q
 from . import core, fisher, token_prediction
 
-
-# Quantisation-Aware Training
-
-LRSchedule: TypeAlias = Literal["constant", "cosine", "linear"]
+# Settings
 
 
 @dataclass
-class Training:
-    lr: float
+class Baseline:
+    pass
+
+
+@dataclass
+class PerturbNoise:
+    ratio: float
+
+
+@dataclass
+class PerturbQuantise:
+    fmt: F.Scaled | Q.TensorFormat
+    bit_allocation: Literal["fixed", "variable"] = "fixed"
+    error_weight: Literal["fisher"] | None = None
+
+
+@dataclass
+class QAT:
+    fmt: F.Scaled | Q.TensorFormat
+    scaling_mode: T.ScalingMode
+    clip_gradient: bool
+    bit_allocation: Literal["fixed", "variable"] = "fixed"
+    error_weight: Literal["fisher"] | None = None
+
+
+Test: TypeAlias = Baseline | PerturbNoise | PerturbQuantise | QAT
+
+
+@dataclass
+class TrainingSettings:
     steps: int
     sequence_length: int
     batch_size: int
     log_interval: int
     valid_sequences: int
-    perturb_ratio: float
-    lr_schedule: LRSchedule = "constant"
-    data_parallel: int = 1
-    compile: str | None = None
+    dataset: str = "DKYoon/SlimPajama-6B"
+
+
+@dataclass
+class LRModifiers:
+    weight: float = 1.0
+    scale: float = 1.0
+    centroids: float = 1.0
+    other: float = 1.0
+
+
+LRSchedule: TypeAlias = Literal["constant", "cosine", "linear"]
+
+
+@dataclass
+class OptimiserSettings:
+    lr: float
+    lr_modifiers: LRModifiers = dataclasses.field(default_factory=LRModifiers)
+    lr_schedule: LRSchedule = "cosine"
+    betas: tuple[float, float] = (0.9, 0.9)
+    eps: float = 1e-5
+    weight_decay: float = 0.0
+
+
+@dataclass
+class ExecutionSettings:
+    data_parallel: int = torch.cuda.device_count()
+    compile: str | None = "default"
+    memory_profile: str | None = None
     params_dtype: torch.dtype = torch.float32
     compute_dtype: torch.dtype = torch.bfloat16
     reference_dtype: torch.dtype = torch.bfloat16
-    adam_betas: tuple[float, float] = (0.9, 0.9)
-    adam_eps: float = 1e-5
-    weight_decay: float = 0.0
-    dataset: str = "DKYoon/SlimPajama-6B"
-    memory_profile: str | None = None
-
-
-class XEnt_Destructive(torch.autograd.Function):
-    """A somewhat dangerous in-place Cross-Entropy, optimised for memory-efficiency.
-
-    Both forward and backward passes mutate `input_logits` in-place. It is unsafe for
-    `input_logits` to be consumed by any other operation.
-    """
-
-    @staticmethod
-    def forward(ctx, input_logits, target_p, mask):
-        input_logp = input_logits.sub_(torch.logsumexp(input_logits, -1, keepdim=True))
-        del input_logits
-        ctx.save_for_backward(input_logp, target_p, mask)
-        return torch.dot(target_p.flatten(), input_logp.flatten()).neg()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        input_logp, target_p, mask = ctx.saved_tensors
-        grad_input_logits = (
-            input_logp.exp_().sub_(target_p).mul_(mask).mul_(grad_output)
-        )
-        del input_logp
-        return grad_input_logits, None, None
-
-
-def compute_kl_loss(
-    model: nn.Module, reference_model: nn.Module, batch: dict[str, Tensor]
-) -> Tensor:
-    """Computes the KL divergence between the output of two models, with care for memory."""
-    with torch.no_grad():
-        reference_logp = torch.log_softmax(reference_model(**batch).logits, -1)
-        reference_p = reference_logp.exp().mul_(batch["attention_mask"].unsqueeze(-1))
-        # Calculate reference entropy here, so we can free up `reference_logp`
-        reference_ent = -torch.dot(reference_p.flatten(), reference_logp.flatten())
-        del reference_logp
-
-    xent = XEnt_Destructive.apply(
-        model(**batch).logits,
-        reference_p,
-        batch["attention_mask"].unsqueeze(-1),
-    )
-    return xent - reference_ent
-
-
-def _fully_shard_model(model: nn.Module, **args: Any) -> None:
-    fsdp.fully_shard(model.model.embed_tokens, **args)
-    for layer in model.model.layers:
-        fsdp.fully_shard(layer, **args)
-    fsdp.fully_shard(model.lm_head, **args)
-    fsdp.fully_shard(model, **args)
-
-
-def _is_master() -> bool:
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank() == 0
-    return True
-
-
-class _Logger:
-    def __init__(
-        self,
-        settings: Training,
-        experiment: core.Experiment | None,
-        valid_data: token_prediction.Dataset | None,
-        model: nn.Module,
-    ):
-        self.settings = settings
-        self.experiment = experiment
-        self.valid_data = valid_data
-        self.model = model
-
-        # State
-        self._step = 0
-        self._logged_step = 0
-        self._t0 = time.time()
-        self._total_loss = torch.tensor(0.0)
-        self._total_count = torch.tensor(0)
-        self._log = core.AttrDict(loss=[], duration=[])
-        self._validate_and_log()
-
-    def _validate_and_log(self) -> None:
-        # Compute statistics
-        if self.settings.data_parallel > 1:
-            torch.distributed.all_reduce(self._total_loss)
-            torch.distributed.all_reduce(self._total_count)
-        t1 = time.time()  # don't count validation
-        if self._step == self._logged_step:
-            self._log.loss.append(None)
-            self._log.duration.append(None)
-        else:
-            self._log.loss.append(self._total_loss.div(self._total_count).item())
-            self._log.duration.append(
-                (t1 - self._t0) / (self._step - self._logged_step)
-            )
-        if self.valid_data is not None:
-            for k, v in self.valid_data.evaluate(self.model).items():
-                self._log.setdefault(f"valid_{k}", []).append(v.mean().item())
-
-        # Write logs
-        if _is_master():
-            print(
-                f"{self._step:>04}:  "
-                + "  ".join(
-                    f"{k}={v[-1]:.3f}"
-                    for k, v in self._log.items()
-                    if v[-1] is not None
-                ),
-                file=sys.stderr,
-            )
-        if self.experiment is not None:
-            self.experiment.summary(train=self._log)
-
-        # Reset
-        self._total_loss.zero_()
-        self._total_count.zero_()
-        self._t0 = time.time()
-        self._logged_step = self._step
-
-    def log(self, loss: Tensor, count: Tensor) -> None:
-        self._total_loss.add_(loss.float())
-        self._total_count.add_(count)
-        self._step += 1
-        if self._step % self.settings.log_interval == 0:
-            self._validate_and_log()
-
-
-def lr_schedule_fn(name: LRSchedule, steps: int) -> Callable[[int], float]:
-    if name == "constant":
-        return lambda _: 1.0
-    if name == "linear":
-        return lambda n: 1 - n / steps
-    if name == "cosine":
-        return lambda n: 0.5 * (math.cos(math.pi * n / steps) + 1)
-    raise ValueError(f"Unexpected schedule {name!r}")
-
-
-def train(
-    model_id: str, settings: Training, experiment: core.Experiment | None
-) -> nn.Module:
-    with contextlib.ExitStack() as exit:
-        if _is_master() and settings.memory_profile:
-            exit.enter_context(core.cuda_memory_history(Path(settings.memory_profile)))
-
-        # Loading
-        reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-            model_id,
-            device_map=torch.get_default_device(),
-            torch_dtype=settings.reference_dtype,
-        )
-        model = copy.deepcopy(reference_model).to(settings.params_dtype)
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
-        tokenizer.pad_token = tokenizer.eos_token
-        data = datasets.load_dataset("DKYoon/SlimPajama-6B")["train"]
-        valid_data = (
-            token_prediction.Dataset.load(
-                reference_model,
-                sequence_length=4096,
-                batch_size=1,
-                kl_topk=128,
-                sequence_limit=settings.valid_sequences,
-            )
-            if settings.valid_sequences
-            else None
-        )
-
-        # Modifying
-        for p in model.parameters():
-            if p.ndim == 2:
-                p.data += torch.randn_like(p).mul(p.std() * settings.perturb_ratio)
-
-        # Preparing
-        if torch.distributed.is_initialized():
-            assert settings.data_parallel == torch.distributed.get_world_size()
-            data = data.shard(
-                torch.distributed.get_world_size(), torch.distributed.get_rank()
-            )
-            _fully_shard_model(
-                model,
-                mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=settings.compute_dtype),
-            )
-        else:
-            assert settings.data_parallel == 1
-            assert settings.compute_dtype == settings.params_dtype
-            assert settings.params_dtype == settings.reference_dtype
-
-        exit.enter_context(fisher.activation_checkpointing_enabled(model))
-        if settings.compile:
-            reference_model = torch.compile(reference_model, mode=settings.compile)
-            model = torch.compile(model, mode=settings.compile)
-
-        # Training
-        opt = torch.optim.AdamW(
-            model.parameters(),
-            lr=torch.tensor(settings.lr),
-            betas=settings.adam_betas,
-            eps=settings.adam_eps,
-            weight_decay=settings.weight_decay,
-        )
-        schedule = torch.optim.lr_scheduler.LambdaLR(
-            opt, lr_schedule_fn(settings.lr_schedule, settings.steps)
-        )
-        assert settings.batch_size % settings.data_parallel == 0
-        data_iter = data.iter(settings.batch_size // settings.data_parallel)
-        logger = _Logger(
-            settings,
-            experiment=experiment,
-            valid_data=valid_data,
-            model=model,
-        )
-        for _ in range(settings.steps):
-            batch = tokenizer.batch_encode_plus(
-                next(data_iter)["text"],
-                return_tensors="pt",
-                padding="max_length",
-                max_length=settings.sequence_length,
-                truncation=True,
-            )
-            opt.zero_grad()
-            loss = compute_kl_loss(model, reference_model, batch)
-            loss.backward()
-            opt.step()
-            schedule.step()
-            logger.log(loss.float(), batch.attention_mask.sum())
-
-        # Returning
-        for m in model.modules():
-            if isinstance(m, fsdp.FSDPModule):
-                m.unshard()
-        return model
-
-
-@contextlib.contextmanager
-def init_distributed(**args: Any) -> Iterable[None]:
-    torch.distributed.init_process_group(**args)
-    try:
-        device = torch.device("cuda", torch.distributed.get_rank())
-        torch.cuda.set_device(device)
-        torch.set_default_device(device)
-        transformers.utils.logging.disable_progress_bar()
-        datasets.utils.logging.disable_progress_bar()
-        yield
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-def _train_worker(dist_kwargs: dict[str, Any], train_kwargs: dict[str, Any]) -> Any:
-    with init_distributed(**dist_kwargs):
-        return train(**train_kwargs)
-
-
-def run_train(
-    model_id: str, settings: Training, experiment: core.Experiment | None
-) -> nn.Module:
-    port = torch.randint(10000, 20000, ()).item()
-    dist_kwargs = dict(
-        world_size=settings.data_parallel, init_method=f"tcp://localhost:{port}"
-    )
-    train_kwargs = dict(model_id=model_id, settings=settings, experiment=experiment)
-    processes = [
-        multiprocessing.Process(
-            target=_train_worker,
-            kwargs=dict(
-                dist_kwargs=dict(rank=n, **dist_kwargs), train_kwargs=train_kwargs
-            ),
-        )
-        for n in range(1, settings.data_parallel)
-    ]
-    for p in processes:
-        p.start()
-    try:
-        return _train_worker(
-            dist_kwargs=dict(rank=0, **dist_kwargs), train_kwargs=train_kwargs
-        )
-    finally:
-        for p in processes:
-            p.join()
-
-
-# Downstream Tasks
 
 
 @dataclass
 class Task:
     name: str
-    limit: int | None
+    limit: int | None = None
 
 
-TASKS = [
-    Task(name=name, limit=d.get("limit"))
-    for name, d in [
-        # Selected cloze vs multiple-choice based on a baseline sweep
+TASKS = tuple(
+    [
+        # Selected cloze or multiple-choice, based on a baseline sweep
         # named "20250611-downstream-baselines"
-        ("arc_challenge:mc", {}),
-        ("arc_easy:mc", {}),
-        ("boolq", {}),
-        ("csqa:mc", {}),
-        ("hellaswag", dict(limit=1000)),
-        ("openbookqa:mc", {}),
-        ("piqa", {}),
-        ("socialiqa:mc", {}),
-        ("winogrande", {}),
+        Task(name=name, limit=d.get("limit"))
+        for name, d in [
+            ("arc_challenge:mc", {}),
+            ("arc_easy:mc", {}),
+            ("boolq", {}),
+            ("csqa:mc", {}),
+            ("hellaswag", dict(limit=1000)),
+            ("openbookqa:mc", {}),
+            ("piqa", {}),
+            ("socialiqa:mc", {}),
+            ("winogrande", {}),
+        ]
     ]
-]
+)
+
+
+@dataclass
+class Run:
+    experiment: str
+    model: str
+    test: Test
+    train: TrainingSettings
+    opt: OptimiserSettings
+    exe: ExecutionSettings
+    tasks: tuple[Task, ...] = TASKS
+    type: str = "qat"
+
+    def to_config(self) -> dict[str, Any]:
+        config = dataclasses.asdict(self)
+        if hasattr(self.test, "fmt"):
+            config["test"]["fmt_str"] = str(self.test.fmt)
+        return config
+
+
+# Downstream Tasks
 
 
 def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
@@ -379,62 +171,383 @@ def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
     return results
 
 
-# Top-level
+# Quantisation-Aware Training
 
 
-@dataclass
-class Run:
-    experiment: str
-    model: str
-    tasks: list[Task]
-    fmt: M.FmtSpec | None
-    bit_allocation: Literal["fixed", "variable"] = "fixed"
-    error_weight: Literal[None, "fisher", "parameter"] = None
-    device: torch.device = core.FIELD_DEVICE
-    type: str = "qat"
+class XEnt_Destructive(torch.autograd.Function):
+    """A somewhat dangerous in-place Cross-Entropy, optimised for memory-efficiency.
+
+    Both forward and backward passes mutate `input_logits` in-place. It is unsafe for
+    `input_logits` to be consumed by any other operation.
+    """
+
+    @staticmethod
+    def forward(ctx, input_logits, target_p, mask):
+        input_logp = input_logits.sub_(torch.logsumexp(input_logits, -1, keepdim=True))
+        del input_logits
+        ctx.save_for_backward(input_logp, target_p, mask)
+        return torch.dot(target_p.flatten(), input_logp.flatten()).neg()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_logp, target_p, mask = ctx.saved_tensors
+        grad_input_logits = (
+            input_logp.exp_().sub_(target_p).mul_(mask).mul_(grad_output)
+        )
+        del input_logp
+        return grad_input_logits, None, None
 
 
-class _Runner:
-    def __init__(self):
-        self.model = None
+def _compute_kl_loss(
+    model: nn.Module, reference_model: nn.Module, batch: dict[str, Tensor]
+) -> Tensor:
+    """Computes the KL divergence between the output of two models, with care for memory."""
+    with torch.no_grad():
+        reference_logp = torch.log_softmax(reference_model(**batch).logits, -1)
+        reference_p = reference_logp.exp().mul_(batch["attention_mask"].unsqueeze(-1))
+        # Calculate reference entropy here, so we can free up `reference_logp`
+        reference_ent = -torch.dot(reference_p.flatten(), reference_logp.flatten())
+        del reference_logp
 
-    def __call__(self, run: Run) -> None:
-        if self.model is None or self.model.model.config._name_or_path != run.model:
-            self.model = core.RequantisableModel.load(
-                run.model, device=run.device, dtype=torch.bfloat16
+    xent = XEnt_Destructive.apply(
+        model(**batch).logits,
+        reference_p,
+        batch["attention_mask"].unsqueeze(-1),
+    )
+    return xent - reference_ent
+
+
+def _fully_shard_model(model: nn.Module, **args: Any) -> None:
+    fsdp.fully_shard(model.model.embed_tokens, **args)
+    for layer in model.model.layers:
+        fsdp.fully_shard(layer, **args)
+    fsdp.fully_shard(model.model.norm, **args)
+    fsdp.fully_shard(model.lm_head, **args)
+    # fsdp.fully_shard(model, **args)  # breaks unshard()ed OLMES evaluation
+
+
+def _is_master() -> bool:
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
+
+def _bits_per_param(model: nn.Module) -> float:
+    # We assume torch.bfloat16, even if not using it, as this was "original precision"
+    return T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
+
+
+def _lr_schedule_fn(name: LRSchedule, steps: int) -> Callable[[int], float]:
+    if name == "constant":
+        return lambda _: 1.0
+    if name == "linear":
+        return lambda n: 1 - n / steps
+    if name == "cosine":
+        return lambda n: 0.5 * (math.cos(math.pi * n / steps) + 1)
+    raise ValueError(f"Unexpected schedule {name!r}")
+
+
+def _process_model(model: transformers.PreTrainedModel, test: Test) -> dict[str, Any]:
+    if isinstance(test, Baseline):
+        return {}
+
+    if isinstance(test, PerturbNoise):
+        for p in model.parameters():
+            if p.ndim == 2:
+                scale = p.pow(2).mean(dtype=torch.float32).sqrt().mul(test.ratio)
+                p.data += torch.randn_like(p).mul(scale)
+        return {}
+
+    if isinstance(test, PerturbQuantise):
+        error_weight = (
+            None
+            if test.error_weight is None
+            else fisher.fetch_fisher(model.config._name_or_path, model.device)
+        )
+        if test.bit_allocation == "fixed":
+            log = M.quantise_2d_fixed(model, test.fmt, error_weight=error_weight)
+            return dict(init_bits_per_param=log["bits_per_param"])
+        elif test.bit_allocation == "variable":
+            fisher_sum = fisher.fetch_fisher_sum(model.config._name_or_path)
+            log = M.quantise_2d_variable(
+                model,
+                test.fmt,
+                fisher_sum=fisher_sum,
+                min_element_bits=None,
+                error_weight=error_weight,
+            )
+            return dict(init_bits_per_param=log["bits_per_param"])
+        else:
+            raise ValueError(f"Unexpected bit_allocation={test.bit_allocation!r}")
+
+    if isinstance(test, QAT):
+        if test.bit_allocation == "variable":
+            raise NotImplementedError("bit_allocation=='variable' is not implemented")
+        T.convert(
+            model,
+            fmt_spec=test.fmt,
+            scaling_mode=test.scaling_mode,
+            clip_gradient=test.clip_gradient,
+            error_weight=(
+                None
+                if test.error_weight is None
+                else fisher.fetch_fisher(model.config._name_or_path, model.device)
+            ),
+        )
+        return {}
+
+    raise ValueError(f"Unexpected test {type(test)}")
+
+
+def _iter_batches(
+    dataset: str, model: str, batch_size: int, sequence_length: int, data_parallel: int
+) -> Iterable[dict[str, Tensor]]:
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model)
+    tokenizer.pad_token = tokenizer.eos_token
+    data = datasets.load_dataset(dataset)["train"]
+    if data_parallel >= 2:
+        assert data_parallel == torch.distributed.get_world_size()
+        data = data.shard(
+            torch.distributed.get_world_size(), torch.distributed.get_rank()
+        )
+    assert batch_size % data_parallel == 0
+    for batch in data.iter(batch_size // data_parallel):
+        yield tokenizer.batch_encode_plus(
+            batch["text"],
+            return_tensors="pt",
+            padding="max_length",
+            max_length=sequence_length,
+            truncation=True,
+        )
+
+
+def _create_optimiser(
+    model: transformers.PreTrainedModel, opt: OptimiserSettings
+) -> torch.optim.Optimizer:
+    # If we run anything before creating the optimiser, we may have unsharded the model.
+    # We must reshard it here before creating the optimiser, or we won't train anything.
+    for m in model.modules():
+        if isinstance(m, fsdp.FSDPModule):
+            m.reshard()
+
+    if any(isinstance(m, T.Weight) for m in model.modules()):
+        param_groups = [
+            dict(
+                params=T.get_named_parameters(model, category),
+                lr=torch.tensor(opt.lr * getattr(opt.lr_modifiers, category)),
+            )
+            for category in ["weight", "scale", "centroids", "other"]
+        ]
+    else:
+        param_groups = [dict(params=model.named_parameters(), lr=torch.tensor(opt.lr))]
+
+    return torch.optim.AdamW(
+        [g for g in param_groups if g["params"]],
+        lr=0,
+        betas=opt.betas,
+        eps=opt.eps,
+        weight_decay=opt.weight_decay,
+    )
+
+
+class _Logger:
+    def __init__(
+        self,
+        log_interval: int,
+        valid_sequences: int,
+        data_parallel: int,
+        experiment: core.Experiment | None,
+        reference_model: nn.Module,
+        model: nn.Module,
+    ):
+        self.log_interval = log_interval
+        self.valid_sequences = valid_sequences
+        self.data_parallel = data_parallel
+        self.experiment = experiment
+        self.model = model
+        if valid_sequences:
+            self.valid_data = token_prediction.Dataset.load(
+                reference_model,
+                sequence_length=4096,
+                batch_size=1,
+                kl_topk=128,
+                sequence_limit=valid_sequences,
             )
 
-        config = dataclasses.asdict(run)
-        config["fmt_str"] = str(run.fmt) if run.fmt else None
-        with core.Experiment(config) as experiment:
-            self.model.reset()
-            if run.fmt is None:
-                quantisation_log = M.no_quantisation(self.model.model)
-            elif run.bit_allocation == "fixed":
-                quantisation_log = M.quantise_2d_fixed(
-                    self.model.model, run.fmt, error_weight=run.error_weight
-                )
-            elif run.bit_allocation == "variable":
-                fisher_sum = fisher.fetch_fisher_sum(
-                    self.model.model.config._name_or_path
-                )
-                quantisation_log = M.quantise_2d_variable(
-                    self.model.model,
-                    run.fmt,
-                    fisher_sum=fisher_sum,
-                    min_element_bits=None,
-                    error_weight=run.error_weight,
-                )
-            else:
-                raise ValueError(f"Unexpected bit_allocation={run.bit_allocation!r}")
+        # State
+        self._step = 0
+        self._logged_step = 0
+        self._t0 = time.time()
+        self._total_loss = torch.tensor(0.0)
+        self._total_count = torch.tensor(0)
+        self._log = core.AttrDict(loss=[], duration=[], bits_per_param=[])
+        self._validate_and_log()
 
+    def validate(self) -> dict[str, float]:
+        if self.valid_sequences:
+            return {
+                f"valid_{k}": v.mean().item()
+                for k, v in self.valid_data.evaluate(self.model).items()
+            }
+        return {}
+
+    def _validate_and_log(self) -> None:
+        # Compute statistics
+        if self.data_parallel > 1:
+            torch.distributed.all_reduce(self._total_loss)
+            torch.distributed.all_reduce(self._total_count)
+        t1 = time.time()  # don't count validation time
+        if self._step == self._logged_step:
+            self._log.loss.append(None)
+            self._log.duration.append(None)
+        else:
+            self._log.loss.append(self._total_loss.div(self._total_count).item())
+            self._log.duration.append(
+                (t1 - self._t0) / (self._step - self._logged_step)
+            )
+        self._log.bits_per_param.append(_bits_per_param(self.model))
+        for k, v in self.validate().items():
+            self._log.setdefault(k, []).append(v)
+
+        # Write logs
+        if _is_master():
+            print(
+                f"{self._step:>04}:  "
+                + "  ".join(
+                    f"{k}={v[-1]:.3f}"
+                    for k, v in self._log.items()
+                    if v[-1] is not None
+                ),
+                file=sys.stderr,
+            )
+        if self.experiment is not None:
+            self.experiment.summary(train=self._log)
+
+        # Reset
+        self._total_loss.zero_()
+        self._total_count.zero_()
+        self._t0 = time.time()
+        self._logged_step = self._step
+
+    def log(self, loss: Tensor, count: Tensor) -> None:
+        self._total_loss.add_(loss.float())
+        self._total_count.add_(count)
+        self._step += 1
+        if self._step % self.log_interval == 0:
+            self._validate_and_log()
+
+
+def _run_worker(run: Run) -> None:
+    with contextlib.ExitStack() as exit:
+        experiment = (
+            exit.enter_context(core.Experiment(run.to_config()))
+            if _is_master()
+            else None
+        )
+        if _is_master() and run.exe.memory_profile:
+            exit.enter_context(core.cuda_memory_history(Path(run.exe.memory_profile)))
+
+        # Loading
+        reference_model = transformers.AutoModelForCausalLM.from_pretrained(
+            run.model, torch_dtype=run.exe.reference_dtype
+        )
+        model = copy.deepcopy(reference_model).to(run.exe.params_dtype)
+        process_log = _process_model(model, run.test)
+        if experiment:
+            experiment.summary(**process_log)
+
+        # Preparation
+        if torch.distributed.is_initialized():
+            _fully_shard_model(
+                model,
+                mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=run.exe.compute_dtype),
+            )
+        else:
+            assert run.exe.data_parallel == 1
+            assert run.exe.compute_dtype == run.exe.params_dtype
+            assert run.exe.params_dtype == run.exe.reference_dtype
+        exit.enter_context(core.activation_checkpointing_enabled(model))
+        if run.exe.compile:
+            reference_model = torch.compile(reference_model, mode=run.exe.compile)
+            model = torch.compile(model, mode=run.exe.compile)
+
+        # Training
+        logger = _Logger(
+            log_interval=run.train.log_interval,
+            valid_sequences=run.train.valid_sequences,
+            data_parallel=run.exe.data_parallel,
+            experiment=experiment,
+            reference_model=reference_model,
+            model=model,
+        )
+        if run.train.steps:
+            opt = _create_optimiser(model, run.opt)
+            schedule = torch.optim.lr_scheduler.LambdaLR(
+                opt, _lr_schedule_fn(run.opt.lr_schedule, run.train.steps)
+            )
+            batches = _iter_batches(
+                run.train.dataset,
+                run.model,
+                batch_size=run.train.batch_size,
+                sequence_length=run.train.sequence_length,
+                data_parallel=run.exe.data_parallel,
+            )
+            for batch in it.islice(batches, run.train.steps):
+                opt.zero_grad()
+                loss = _compute_kl_loss(model, reference_model, batch)
+                loss.backward()
+                opt.step()
+                schedule.step()
+                logger.log(loss.float(), batch["attention_mask"].sum())
+
+        # Evaluation
+        for m in model.modules():
+            if isinstance(m, fsdp.FSDPModule):
+                m.unshard()  # so rank=0 can continue on its own
+        if experiment:
             experiment.summary(
-                **quantisation_log,
-                direct_cast={
-                    task.name: evaluate(self.model.model, task) for task in run.tasks
-                },
+                downstream={task.name: evaluate(model, task) for task in run.tasks},
+                **logger.validate(),
+                bits_per_param=_bits_per_param(model),
+                params=T.count_parameters(model),
             )
 
 
-def run_sweep(runs: Iterable[Run], processes: int | None = None) -> None:
-    core.run_sweep(_Runner, [(run,) for run in runs], processes=processes)
+# Distributed training
+
+
+@contextlib.contextmanager
+def _init_distributed(**args: Any) -> Iterable[None]:
+    torch.distributed.init_process_group(**args)
+    try:
+        device = torch.device("cuda", torch.distributed.get_rank())
+        torch.cuda.set_device(device)
+        torch.set_default_device(device)
+        transformers.utils.logging.disable_progress_bar()
+        datasets.utils.logging.disable_progress_bar()
+        yield
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _init_and_run_worker(run: Run, dist_kwargs: dict[str, Any]) -> Any:
+    with _init_distributed(**dist_kwargs):
+        return _run_worker(run)
+
+
+def run(run: Run) -> None:
+    port = torch.randint(10000, 20000, ()).item()
+    processes: list[multiprocessing.Process] = []
+    for n in range(run.exe.data_parallel):
+        dist_kwargs = dict(
+            rank=n,
+            world_size=run.exe.data_parallel,
+            init_method=f"tcp://localhost:{port}",
+        )
+        p = multiprocessing.Process(
+            target=_init_and_run_worker, args=(run, dist_kwargs)
+        )
+        p.start()
+        processes.append(p)
+    for p in processes:
+        p.join()

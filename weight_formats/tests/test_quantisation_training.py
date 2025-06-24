@@ -73,7 +73,7 @@ def test_weight_matches_format() -> None:
                             # don't count centroids bits
                             weight.centroids.requires_grad_(False)
                             weight_error = Q.rmse_norm(reference_weight, weight())
-                            weight_bits = weight.bits
+                            weight_bits = weight.count_bits(reference_weight.dtype)
                             # print(f"{format} scaling_mode={scaling_mode}")
                             torch.testing.assert_close(
                                 weight_error,
@@ -142,9 +142,10 @@ def test_convert_and_train() -> None:
         ),
         scaling_mode="parameter",
         clip_gradient=True,
+        error_weight=None,
     )
 
-    bpp = T.count_bits(model) / sum(p.nelement() for p in model.parameters())
+    bpp = T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
     assert 3.25 < bpp < 4
 
     opt = torch.optim.Adam(

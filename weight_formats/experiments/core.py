@@ -1,6 +1,7 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
 import collections
+import contextlib
 import dataclasses
 import datetime
 import decimal
@@ -69,6 +70,32 @@ def iter_dict_product(
                 file=sys.stderr,
             )
         yield {**config, **dict(zip(axes, values))}
+
+
+@contextlib.contextmanager
+def activation_checkpointing_enabled(
+    model: transformers.PreTrainedModel,
+) -> Iterable[transformers.PreTrainedModel]:
+    """A context manager to enable activation checkpointing, without enabling dropout.
+
+    Warning - care might be necessary, in case the .training flag on `LlamaModel` etc
+    is used to enable dropout.
+    """
+    assert not model.is_gradient_checkpointing
+    try:
+        # Don't use .train(), as we don't want to enable dropout.
+        # Just hope none of the PreTrainedModel classes don't set dropout themselves.
+        for m in model.modules():
+            if isinstance(m, transformers.modeling_utils.PreTrainedModel):
+                assert not m.training
+                m.training = True
+        model.gradient_checkpointing_enable()
+        yield model
+    finally:
+        model.gradient_checkpointing_disable()
+        for m in model.modules():
+            if isinstance(m, transformers.modeling_utils.PreTrainedModel):
+                m.training = False
 
 
 # RequantisableModel

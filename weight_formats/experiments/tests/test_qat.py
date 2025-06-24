@@ -14,13 +14,13 @@ def test_compute_kl_loss() -> None:
     ).requires_grad_()
     model_logits.retain_grad()
 
-    # Important to do this before running qat.compute_kl_loss
+    # Important to do this before running qat._compute_kl_loss
     model_logits_ref = model_logits.detach().clone().requires_grad_()
     model_logits_ref.retain_grad()
 
     mask = torch.rand(reference_logits.shape[:-1]) < 0.75
 
-    loss = qat.compute_kl_loss(
+    loss = qat._compute_kl_loss(
         lambda attention_mask: AttrDict(logits=model_logits),
         lambda attention_mask: AttrDict(logits=reference_logits),
         AttrDict(attention_mask=mask),
