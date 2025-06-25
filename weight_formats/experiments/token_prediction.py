@@ -194,7 +194,7 @@ class Dataset:
         tokens = self.tokens[index]
         mask = self.masks[index]
         logits = model(
-            nn.functional.pad(tokens, (1, 0), value=self.bos_token_id)
+            nn.functional.pad(tokens, (1, 0), value=self.bos_token_id), use_cache=False
         ).logits
 
         # Cross entropy, over sequence_length-1

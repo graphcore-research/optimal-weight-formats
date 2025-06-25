@@ -7,6 +7,8 @@ import itertools as it
 import math
 import sys
 import time
+import unittest.mock
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, TypeAlias
@@ -22,9 +24,9 @@ from torch import Tensor, nn
 from torch.distributed import fsdp
 
 from .. import fit as F
-from .. import quantisation_training as T
 from .. import model_quantisation as M
 from .. import quantisation as Q
+from .. import quantisation_training as T
 from . import core, fisher, token_prediction
 
 # Settings
@@ -152,7 +154,11 @@ def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
     oe_task = oe_eval.tasks.oe_eval_tasks.TASK_REGISTRY[task.name](task_name=task.name)
     oe_task.download()
     oe_task.build_all_requests(limit=task.limit)
-    oe_model = oe_eval.models.eleuther_huggingface.HFLM_Verbose(model)
+    # Hack around `kwargs["parallelize"] = True`
+    with unittest.mock.patch("torch.cuda.device_count", new=lambda: 1):
+        oe_model = oe_eval.models.eleuther_huggingface.HFLM_Verbose(
+            model, parallelize=False
+        )
     outputs = oe_eval.run_eval.evaluate(
         oe_model,
         instances=oe_task._instances,
@@ -210,7 +216,7 @@ def _compute_kl_loss(
         del reference_logp
 
     xent = XEnt_Destructive.apply(
-        model(**batch).logits,
+        model(**batch, use_cache=False).logits,
         reference_p,
         batch["attention_mask"].unsqueeze(-1),
     )
@@ -540,6 +546,11 @@ def _init_distributed(**args: Any) -> Iterable[None]:
         torch.set_default_device(device)
         transformers.utils.logging.disable_progress_bar()
         datasets.utils.logging.disable_progress_bar()
+        warnings.filterwarnings(
+            "ignore",
+            message="None of the inputs have requires_grad=True. Gradients will be None",
+            category=UserWarning,
+        )
         yield
     finally:
         torch.distributed.destroy_process_group()
