@@ -66,7 +66,7 @@ class TrainingSettings:
     steps: int
     batch_size: int
     log_interval: int
-    valid_sequences: int
+    valid_sequences: int = 132
     sequence_length: int = 1024
     dataset: str = "DKYoon/SlimPajama-6B"
 

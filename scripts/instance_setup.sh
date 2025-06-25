@@ -30,4 +30,4 @@ python3 -m venv ~/weight-formats/venv
 # python3 -m venv --system-site-packages ~/weight-formats/venv  # GH200
 source .venv/bin/activate
 pip install -r requirements.txt
-echo 'export PYTHONPATH="${PYTHONPATH}:$(dirname ${VIRTUAL_ENV})"' >> .venv/bin/activate
+echo 'export PYTHONPATH="${PYTHONPATH}:${HOME}/work' >> .venv/bin/activate
