@@ -38,7 +38,7 @@ class Quantise_STE(torch.autograd.Function):
         if not centroids.requires_grad:
             gcentroids = None
         else:
-            # We found that `index_add_` is hundreds of times slower in bfloat16
+            # We found that `index_add_` can be hundreds of times slower in bfloat16
             # (torch 2.6.0), and also likely to be inaccurate, so perform this
             # operation in float32
             gcentroids = torch.zeros_like(centroids, dtype=torch.float32)

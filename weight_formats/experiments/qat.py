@@ -73,7 +73,7 @@ class TrainingSettings:
 class LRModifiers:
     weight: float = 1.0
     scale: float = 1.0
-    centroids: float = 1.0
+    centroids: float = 0.0  # default to skip (slow) trainable-centroids
     other: float = 1.0
 
 
@@ -217,7 +217,13 @@ def _compute_kl_loss(
     return xent - reference_ent
 
 
-def _fully_shard_model(model: nn.Module, **args: Any) -> None:
+def _compile_transformer_layers(model: transformers.PreTrainedModel, mode: str) -> None:
+    for layer_id, layer in model.model.layers.named_children():
+        layer = torch.compile(layer, mode=mode)
+        model.model.layers.register_module(layer_id, layer)
+
+
+def _fully_shard_model(model: transformers.PreTrainedModel, **args: Any) -> None:
     fsdp.fully_shard(model.model.embed_tokens, **args)
     for layer in model.model.layers:
         fsdp.fully_shard(layer, **args)
@@ -322,32 +328,40 @@ def _iter_batches(
 
 
 def _create_optimiser(
-    model: transformers.PreTrainedModel, opt: OptimiserSettings
-) -> torch.optim.Optimizer:
+    model: transformers.PreTrainedModel, opt: OptimiserSettings, steps: int
+) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
     # If we run anything before creating the optimiser, we may have unsharded the model.
     # We must reshard it here before creating the optimiser, or we won't train anything.
     for m in model.modules():
         if isinstance(m, fsdp.FSDPModule):
             m.reshard()
 
+    param_groups = []
     if any(isinstance(m, T.Weight) for m in model.modules()):
-        param_groups = [
-            dict(
-                params=T.get_named_parameters(model, category),
-                lr=torch.tensor(opt.lr * getattr(opt.lr_modifiers, category)),
-            )
-            for category in ["weight", "scale", "centroids", "other"]
-        ]
+        for category in ["weight", "scale", "centroids", "other"]:
+            params = T.get_named_parameters(model, category)
+            group_lr = opt.lr * getattr(opt.lr_modifiers, category)
+            if group_lr == 0:
+                for _, p in params:
+                    p.requires_grad_(False)
+            elif params:
+                param_groups.append(dict(params=params, lr=torch.tensor(group_lr)))
     else:
-        param_groups = [dict(params=model.named_parameters(), lr=torch.tensor(opt.lr))]
+        param_groups.append(
+            dict(params=model.named_parameters(), lr=torch.tensor(opt.lr))
+        )
 
-    return torch.optim.AdamW(
-        [g for g in param_groups if g["params"]],
+    optimiser = torch.optim.AdamW(
+        param_groups,
         lr=0,
         betas=opt.betas,
         eps=opt.eps,
         weight_decay=opt.weight_decay,
     )
+    schedule = torch.optim.lr_scheduler.LambdaLR(
+        optimiser, _lr_schedule_fn(opt.lr_schedule, steps)
+    )
+    return optimiser, schedule
 
 
 class _Logger:
@@ -457,6 +471,7 @@ def _run_worker(run: Run) -> None:
             experiment.summary(**process_log)
 
         # Preparation
+        exit.enter_context(core.activation_checkpointing_enabled(model))
         if torch.distributed.is_initialized():
             _fully_shard_model(
                 model,
@@ -465,11 +480,12 @@ def _run_worker(run: Run) -> None:
         else:
             assert run.exe.data_parallel == 1
             assert run.exe.compute_dtype == run.exe.params_dtype
-            assert run.exe.params_dtype == run.exe.reference_dtype
-        exit.enter_context(core.activation_checkpointing_enabled(model))
         if run.exe.compile:
-            reference_model = torch.compile(reference_model, mode=run.exe.compile)
-            model = torch.compile(model, mode=run.exe.compile)
+            torch._dynamo.config.cache_size_limit = 64
+            reference_model = torch.compile(
+                reference_model, mode=run.exe.compile, fullgraph=True
+            )
+            _compile_transformer_layers(model, run.exe.compile)
 
         # Training
         logger = _Logger(
@@ -481,10 +497,7 @@ def _run_worker(run: Run) -> None:
             model=model,
         )
         if run.train.steps:
-            opt = _create_optimiser(model, run.opt)
-            schedule = torch.optim.lr_scheduler.LambdaLR(
-                opt, _lr_schedule_fn(run.opt.lr_schedule, run.train.steps)
-            )
+            opt, schedule = _create_optimiser(model, run.opt, run.train.steps)
             batches = _iter_batches(
                 run.train.dataset,
                 run.model,
@@ -505,12 +518,14 @@ def _run_worker(run: Run) -> None:
             if isinstance(m, fsdp.FSDPModule):
                 m.unshard()  # so rank=0 can continue on its own
         if experiment:
-            experiment.summary(
-                downstream={task.name: evaluate(model, task) for task in run.tasks},
-                **logger.validate(),
-                bits_per_param=_bits_per_param(model),
-                params=T.count_parameters(model),
-            )
+            # The compiled model doesn't play well with OLMES, and can recompile validate()
+            with torch._dynamo.set_stance("force_eager"):
+                experiment.summary(
+                    downstream={task.name: evaluate(model, task) for task in run.tasks},
+                    **logger.validate(),
+                    bits_per_param=_bits_per_param(model),
+                    params=T.count_parameters(model),
+                )
 
 
 # Distributed training
