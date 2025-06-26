@@ -34,12 +34,13 @@ from . import core, fisher, token_prediction
 
 @dataclass
 class Baseline:
-    pass
+    type: str = "baseline"
 
 
 @dataclass
 class PerturbNoise:
     ratio: float
+    type: str = "perturb_noise"
 
 
 @dataclass
@@ -47,6 +48,7 @@ class PerturbQuantise:
     fmt: F.Scaled | Q.TensorFormat
     bit_allocation: Literal["fixed", "variable"] = "fixed"
     error_weight: Literal["fisher"] | None = None
+    type: str = "perturb_quantise"
 
 
 @dataclass
@@ -56,6 +58,7 @@ class QAT:
     clip_gradient: bool
     bit_allocation: Literal["fixed", "variable"] = "fixed"
     error_weight: Literal["fisher"] | None = None
+    type: str = "qat"
 
 
 Test: TypeAlias = Baseline | PerturbNoise | PerturbQuantise | QAT
