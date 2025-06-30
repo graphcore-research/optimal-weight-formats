@@ -562,9 +562,10 @@ def _run_worker(run: Run) -> None:
                 schedule.step()
                 logger.log(loss.float(), batch["attention_mask"].sum())
             del opt
-        assert torch.equal(
-            model.lm_head.weight.master, model.model.embed_tokens.weight.master
-        ), "embeddings were un-shared"
+        if model.config.tie_word_embeddings:
+            assert torch.equal(
+                model.lm_head.weight.master, model.model.embed_tokens.weight.master
+            ), "embeddings were un-shared"
         duration_train = time.time() - train_t0
 
         # Evaluation
