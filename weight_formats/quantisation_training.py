@@ -178,6 +178,7 @@ class Weight(nn.Module):
             )
             return self._scale_format.quantise(scale)
 
+    @torch.compiler.disable()  # for the mean-time; this shouldn't be necessary
     def forward(self) -> Tensor:
         weight = self.master.reshape(self._blocked_shape)
         scale = self._get_scale()
@@ -283,6 +284,7 @@ def get_named_parameters(
     "other" -- non-QAT weights (e.g. norms)
     """
     results = []
+    visited: set[nn.Parameter] = set([])
     for mname, m in module.named_modules():
         if isinstance(m, Weight):
             for n, p in m._parameters.items():
@@ -292,10 +294,14 @@ def get_named_parameters(
                     scale="scale",
                     centroids="centroids",
                 )[n]
-                if kind == pkind:
+                if kind == pkind and p not in visited:
                     results.append((f"{mname}.{n}", p))
+                    visited.add(p)
         elif kind == "other":
-            results.extend((f"{mname}.{n}", p) for n, p in m._parameters.items())
+            for n, p in m._parameters.items():
+                if p not in visited:
+                    results.append((f"{mname}.{n}", p))
+                    visited.add(p)
     return results
 
 

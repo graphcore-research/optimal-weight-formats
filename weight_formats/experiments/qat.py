@@ -17,6 +17,7 @@ import datasets
 import oe_eval.models.eleuther_huggingface
 import oe_eval.run_eval
 import oe_eval.tasks.oe_eval_tasks
+import safetensors.torch
 import torch
 import torch.multiprocessing as multiprocessing
 import transformers
@@ -28,6 +29,11 @@ from .. import model_quantisation as M
 from .. import quantisation as Q
 from .. import quantisation_training as T
 from . import core, fisher, token_prediction
+
+CODE_CHANGES = dict(
+    compile_disable=["Weight.forward"],
+    fix_fsdp_embedding_sharing=True,
+)
 
 # Settings
 
@@ -90,7 +96,7 @@ class OptimiserSettings:
     lr: float
     lr_modifiers: LRModifiers = dataclasses.field(default_factory=LRModifiers)
     lr_schedule: LRSchedule = "cosine"
-    betas: tuple[float, float] = (0.9, 0.9)
+    betas: tuple[float, float] = (0.9, 0.95)
     eps: float = 1e-5
     weight_decay: float = 0.0
 
@@ -100,6 +106,7 @@ class ExecutionSettings:
     data_parallel: int = torch.cuda.device_count()
     compile: str | None = "default"
     memory_profile: str | None = None
+    checkpoint: str | None = None
     params_dtype: torch.dtype = torch.float32
     compute_dtype: torch.dtype = torch.bfloat16
     reference_dtype: torch.dtype = torch.bfloat16
@@ -140,6 +147,8 @@ class Run:
     opt: OptimiserSettings
     exe: ExecutionSettings
     tasks: tuple[Task, ...] = TASKS
+    code_changes: dict[str, Any] = dataclasses.field(default_factory=CODE_CHANGES.copy)
+    tag: str = ""
     type: str = "qat"
 
     def to_config(self) -> dict[str, Any]:
@@ -233,18 +242,48 @@ def _compile_transformer_layers(model: transformers.PreTrainedModel, mode: str) 
 
 
 def _fully_shard_model(model: transformers.PreTrainedModel, **args: Any) -> None:
-    fsdp.fully_shard(model.model.embed_tokens, **args)
     for layer in model.model.layers:
         fsdp.fully_shard(layer, **args)
-    fsdp.fully_shard(model.model.norm, **args)
-    fsdp.fully_shard(model.lm_head, **args)
-    # fsdp.fully_shard(model, **args)  # breaks unshard()ed OLMES evaluation
+    # Important to do this at top-level for sake of parameter sharing
+    # note: this breaks unshard()ed OLMES evaluation, so we copy to a non-FSDP model
+    fsdp.fully_shard(model, **args)
 
 
 def _is_master() -> bool:
     if torch.distributed.is_initialized():
         return torch.distributed.get_rank() == 0
     return True
+
+
+def _save_model(model: nn.Module, path: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Use named_parameters() not state_dict() or save_model() to avoid resharding the model
+    safetensors.torch.save_file(dict(model.named_parameters()), path)
+
+
+def _strip_orig_mod(name: str) -> str:
+    return ".".join([p for p in name.split(".") if p != "_orig_mod"])
+
+
+def _unshard_to_new_model(src: nn.Module, dest: nn.Module) -> None:
+    """Unshard `src` then copy parameters to `dest`, of the same structure.
+
+    Since we can't cleanly convert a fully_shard()ed model to a regular model, we
+    copy the parameters to a fresh model.
+    """
+    for m in src.modules():
+        if isinstance(m, fsdp.FSDPModule):
+            m.unshard()
+    src_parameters = {_strip_orig_mod(n): p for n, p in src.named_parameters()}
+    dest_parameters = {_strip_orig_mod(n): p for n, p in dest.named_parameters()}
+    assert set(src_parameters) == set(dest_parameters), (
+        "Parameter lists do not match, "
+        f"(src - dest) = {set(src_parameters) - set(dest_parameters)}"
+        f", (dest - src) = {set(dest_parameters) - set(src_parameters)}"
+    )
+    for n, p in dest_parameters.items():
+        p.data[...] = src_parameters[n]
 
 
 def _bits_per_param(model: nn.Module) -> float:
@@ -497,6 +536,7 @@ def _run_worker(run: Run) -> None:
             _compile_transformer_layers(model, run.exe.compile)
 
         # Training
+        train_t0 = time.time()
         logger = _Logger(
             log_interval=run.train.log_interval,
             valid_sequences=run.train.valid_sequences,
@@ -521,20 +561,35 @@ def _run_worker(run: Run) -> None:
                 opt.step()
                 schedule.step()
                 logger.log(loss.float(), batch["attention_mask"].sum())
+            del opt
+        assert torch.equal(
+            model.lm_head.weight.master, model.model.embed_tokens.weight.master
+        ), "embeddings were un-shared"
+        duration_train = time.time() - train_t0
 
         # Evaluation
-        for m in model.modules():
-            if isinstance(m, fsdp.FSDPModule):
-                m.unshard()  # so rank=0 can continue on its own
-        if experiment:
-            # The compiled model doesn't play well with OLMES, and can recompile validate()
-            with torch._dynamo.set_stance("force_eager"):
-                experiment.summary(
-                    downstream={task.name: evaluate(model, task) for task in run.tasks},
-                    **logger.validate(),
-                    bits_per_param=_bits_per_param(model),
-                    params=T.count_parameters(model),
-                )
+
+        # Convert `reference_model` for use as an unsharded model for final evaluation,
+        # copying the trained parameters into it.
+        if run.exe.compile:
+            reference_model = reference_model._orig_mod
+        _process_model(reference_model, run.test)
+        _unshard_to_new_model(model, reference_model)
+        model = logger.model = reference_model
+        del reference_model
+        if not _is_master():
+            return
+
+        if run.exe.checkpoint:
+            _save_model(model, run.exe.checkpoint)
+
+        experiment.summary(
+            downstream={task.name: evaluate(model, task) for task in run.tasks},
+            **logger.validate(),
+            bits_per_param=_bits_per_param(model),
+            params=T.count_parameters(model),
+            duration_train=duration_train,
+        )
 
 
 # Distributed training
