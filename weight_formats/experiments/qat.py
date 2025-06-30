@@ -224,7 +224,7 @@ def _compute_kl_loss(
         reference_logp = torch.log_softmax(reference_model(**batch).logits, -1)
         reference_p = reference_logp.exp().mul_(batch["attention_mask"].unsqueeze(-1))
         # Calculate reference entropy here, so we can free up `reference_logp`
-        reference_ent = -torch.dot(reference_p.flatten(), reference_logp.flatten())
+        reference_ent = torch.dot(reference_p.flatten(), reference_logp.flatten()).neg()
         del reference_logp
 
     xent = XEnt_Destructive.apply(
@@ -629,7 +629,9 @@ def run(run: Run) -> None:
             init_method=f"tcp://localhost:{port}",
         )
         p = multiprocessing.Process(
-            target=_init_and_run_worker, args=(run, dist_kwargs)
+            target=_init_and_run_worker,
+            args=(run, dist_kwargs),
+            name=f"dist-worker-{n}",
         )
         p.start()
         processes.append(p)
