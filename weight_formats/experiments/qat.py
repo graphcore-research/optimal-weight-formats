@@ -501,6 +501,8 @@ class _Logger:
 
 def _run_worker(run: Run) -> None:
     with contextlib.ExitStack() as exit:
+        if _is_master():
+            print(run.to_config(), file=sys.stderr)
         experiment = (
             exit.enter_context(core.Experiment(run.to_config()))
             if _is_master()
