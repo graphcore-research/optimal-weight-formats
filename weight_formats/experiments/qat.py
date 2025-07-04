@@ -564,7 +564,7 @@ def _run_worker(run: Run) -> None:
                 schedule.step()
                 logger.log(loss.float(), batch["attention_mask"].sum())
             del opt
-        if model.config.tie_word_embeddings:
+        if model.config.tie_word_embeddings and isinstance(run.test, QAT):
             assert torch.equal(
                 model.lm_head.weight.master, model.model.embed_tokens.weight.master
             ), "embeddings were un-shared"

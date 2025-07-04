@@ -637,13 +637,19 @@ def crd_quantiser(
     }[(mode, scaling)]
     if not (neg_max or pos_min):
         # Need to special-case this, otherwise we'd have a double-gap around zero
-        p = torch.linspace(0, 1, n + 2 - neg_min - pos_max)[1 - neg_min :][:n]
+        p = torch.linspace(0, 1, n + 2 - neg_min - pos_max, device="cpu")[
+            1 - neg_min :
+        ][:n]
     else:
         halfn = n // 2
         off = 1 - neg_min
-        p_neg = torch.linspace(0, 0.5, halfn + 2 - neg_min - neg_max)[off : halfn + off]
+        p_neg = torch.linspace(0, 0.5, halfn + 2 - neg_min - neg_max, device="cpu")[
+            off : halfn + off
+        ]
         off = 1 - pos_min
-        p_pos = torch.linspace(0.5, 1, halfn + 2 - pos_min - pos_max)[off : halfn + off]
+        p_pos = torch.linspace(0.5, 1, halfn + 2 - pos_min - pos_max, device="cpu")[
+            off : halfn + off
+        ]
         p = torch.cat([p_neg, p_pos])
 
     if power == 0:
