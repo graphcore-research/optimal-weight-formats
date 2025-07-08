@@ -5,19 +5,13 @@ import weight_formats.fit as F
 import weight_formats.quantisation as Q
 
 if __name__ == "__main__":
+    fmt = F.Scaled(4, "int", Q.BFLOAT16, (1, 64), "absmax", "moments")
     runs = [
         EQ.Run(
             "dev",
             model="meta-llama/Llama-3.2-1B",
             test=EQ.QAT(
-                F.Scaled(
-                    4,
-                    "int",
-                    Q.BFLOAT16,
-                    (1, 64),
-                    "absmax",
-                    "moments",
-                ),
+                fmt,
                 scaling_mode="dynamic",
                 clip_gradient=False,
             ),
@@ -32,5 +26,4 @@ if __name__ == "__main__":
             tasks=(EQ.Task("arc_easy:mc"),),
         )
     ]
-    for run in runs:
-        EQ.run(run)
+    EQ.run_sweep(runs)

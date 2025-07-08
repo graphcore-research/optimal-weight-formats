@@ -1,10 +1,13 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
+import concurrent.futures
 import contextlib
 import copy
 import dataclasses
 import itertools as it
 import math
+import os
+import queue
 import sys
 import time
 import unittest.mock
@@ -664,13 +667,18 @@ def _init_distributed(**args: Any) -> Iterable[None]:
         torch.distributed.destroy_process_group()
 
 
-def _init_and_run_worker(run: Run, dist_kwargs: dict[str, Any]) -> Any:
+def _init_and_run_worker(
+    run: Run, devices: list[int] | None, dist_kwargs: dict[str, Any]
+) -> Any:
+    if devices:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
     with _init_distributed(**dist_kwargs):
         return _run_worker(run)
 
 
-def run(run: Run) -> None:
-    port = torch.randint(10000, 20000, ()).item()
+def run(run: Run, port: int | None = None, devices: list[int] | None = None) -> None:
+    if port is None:
+        port = torch.randint(10000, 20000, ()).item()
     processes: list[multiprocessing.Process] = []
     for n in range(run.exe.data_parallel):
         dist_kwargs = dict(
@@ -680,10 +688,38 @@ def run(run: Run) -> None:
         )
         p = multiprocessing.Process(
             target=_init_and_run_worker,
-            args=(run, dist_kwargs),
+            args=(run, devices, dist_kwargs),
             name=f"dist-worker-{n}",
         )
         p.start()
         processes.append(p)
     for p in processes:
         p.join()
+
+
+def run_sweep(runs: list[Run]) -> None:
+    n_device = torch.cuda.device_count()
+    (data_parallel,) = set(run.exe.data_parallel for run in runs)
+    assert (
+        n_device % data_parallel == 0
+    ), f"bad sweep: device count {n_device} must be a multiple of run.exe.data_parallel {data_parallel}"
+    n_workers = n_device // data_parallel
+
+    # The worker_queue is a list of available worker IDs
+    worker_queue = queue.SimpleQueue()
+    for i in range(n_workers):
+        worker_queue.put(i)
+
+    def _sweep_runner(run_: Run) -> None:
+        worker_id = worker_queue.get()
+        try:
+            devices = list(
+                range(data_parallel * worker_id, data_parallel * (worker_id + 1))
+            )
+            run(run_, port=15300 + worker_id, devices=devices)
+        finally:
+            worker_queue.put(worker_id)
+
+    with concurrent.futures.ThreadPoolExecutor(n_workers) as pool:
+        for run_ in runs:
+            pool.submit(_sweep_runner, run_)
