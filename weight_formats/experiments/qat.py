@@ -567,13 +567,14 @@ def _run_worker(run: Run) -> None:
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
             run.model, torch_dtype=run.exe.reference_dtype
         )
-        model = copy.deepcopy(reference_model).to(run.exe.params_dtype)
+        model = copy.deepcopy(reference_model)
         process_log = _process_model(model, run.test)
         if experiment:
             experiment.summary(**process_log)
         eval_model = _deepcopy_with_dummy_params(model, dtype=run.exe.compute_dtype)
 
         # Preparation
+        model.to(run.exe.params_dtype)
         exit.enter_context(core.activation_checkpointing_enabled(model))
         if torch.distributed.is_initialized():
             _fully_shard_model(
