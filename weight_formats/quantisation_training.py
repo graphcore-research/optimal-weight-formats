@@ -207,12 +207,15 @@ class Linear(nn.Module):
 
 
 class Embedding(nn.Module):
-    def __init__(self, weight: Weight):
+    def __init__(self, weight: Weight, padding_idx: int | None):
         super().__init__()
         self.weight = weight
+        self.padding_idx = padding_idx
 
     def forward(self, input: Tensor) -> Tensor:
-        return nn.functional.embedding(input, self.weight())
+        return nn.functional.embedding(
+            input, self.weight(), padding_idx=self.padding_idx
+        )
 
 
 def convert(
@@ -243,14 +246,12 @@ def convert(
                     )
 
                 if isinstance(child, nn.Embedding):
-                    if type(child) != nn.Embedding or not (
-                        child.padding_idx is None and child.max_norm is None
-                    ):
+                    if type(child) != nn.Embedding or not (child.max_norm is None):
                         raise ValueError(
-                            f"Cannot convert {type(child)}(padding_idx={child.padding_idx}"
-                            f", max_norm={child.max_norm})"
+                            f"Cannot convert {type(child)}(max_norm={child.max_norm})"
                         )
                     replace_cls = Embedding
+                    replace_args = dict(padding_idx=child.padding_idx)
 
                 if replace_cls:
                     if child.weight in shared_weights:

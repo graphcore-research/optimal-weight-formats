@@ -116,6 +116,20 @@ def test_weight_gradients() -> None:
     assert weight.sparse_weight.grad.equal(torch.full((3,), 1.0))
 
 
+def test_convert_embedding() -> None:
+    torch.manual_seed(100)
+    model = nn.Embedding(100, 16, padding_idx=0)
+    input = torch.randint(0, 100, (5,))
+    T.convert(
+        model,
+        F.Scaled(3, "int", Q.BFLOAT16, (1, 8), "absmax"),
+        "dynamic",
+        clip_gradient=False,
+        error_weight=None,
+    )
+    assert model(input).shape == (5, 16)
+
+
 def test_convert_and_train() -> None:
     torch.manual_seed(100)
     reference = nn.Sequential(
