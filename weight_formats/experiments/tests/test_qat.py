@@ -1,8 +1,10 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
+import torch
+from torch import nn
+
 from .. import qat
 from ..core import AttrDict
-import torch
 
 
 def test_compute_kl_loss() -> None:
@@ -21,8 +23,8 @@ def test_compute_kl_loss() -> None:
     mask = torch.rand(reference_logits.shape[:-1]) < 0.75
 
     loss = qat._compute_kl_loss(
-        lambda attention_mask: AttrDict(logits=model_logits),
-        lambda attention_mask: AttrDict(logits=reference_logits),
+        lambda attention_mask, use_cache: AttrDict(logits=model_logits),
+        lambda attention_mask, use_cache: AttrDict(logits=reference_logits),
         AttrDict(attention_mask=mask),
     )
     loss.backward()
@@ -41,3 +43,22 @@ def test_compute_kl_loss() -> None:
 
     torch.testing.assert_close(loss, loss_ref)
     torch.testing.assert_close(model_logits.grad, model_logits_ref.grad)
+
+
+def test_deepcopy_with_dummy_params() -> None:
+    torch.manual_seed(100)
+    batch = torch.randn(5, 10)
+    model = nn.Sequential(
+        nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 20), nn.Linear(20, 20)
+    )
+    model[-2].weight = model[-1].weight
+    model_copy = qat._deepcopy_with_dummy_params(model)
+    assert model_copy[-2].weight is model_copy[-1].weight
+    for p in model_copy.parameters():
+        assert all(s == 0 for s in p.stride())
+    assert model_copy(batch).isnan().all()
+
+    qat._replace_params(model_copy, dict(model.named_parameters()))
+    assert model_copy[-1].weight is not model[-1].weight
+    assert model_copy[-2].weight is model_copy[-1].weight
+    torch.testing.assert_close(model_copy(batch), model(batch))

@@ -221,7 +221,9 @@ def _compute_kl_loss(
 ) -> Tensor:
     """Computes the KL divergence between the output of two models, with care for memory."""
     with torch.no_grad():
-        reference_logp = torch.log_softmax(reference_model(**batch).logits, -1)
+        reference_logp = torch.log_softmax(
+            reference_model(**batch, use_cache=False).logits, -1
+        )
         reference_p = reference_logp.exp().mul_(batch["attention_mask"].unsqueeze(-1))
         # Calculate reference entropy here, so we can free up `reference_logp`
         reference_ent = torch.dot(reference_p.flatten(), reference_logp.flatten()).neg()
@@ -262,8 +264,51 @@ def _save_model(model: nn.Module, path: str) -> None:
     safetensors.torch.save_file(dict(model.named_parameters()), path)
 
 
-def _strip_orig_mod(name: str) -> str:
-    return ".".join([p for p in name.split(".") if p != "_orig_mod"])
+def _deepcopy_with_dummy_params(
+    model: nn.Module, dtype: torch.dtype | None = None
+) -> nn.Module:
+    """Deep copy a module, but replace all parameters with low-memory aliases."""
+    model_copy = copy.deepcopy(model)
+    param_map = {}
+
+    def _visit(m: nn.Module) -> None:
+        for child in m.children():
+            _visit(child)
+        for k, v in m.named_parameters(recurse=False):
+            new_v = param_map.get(v)
+            if new_v is None:
+                new_v = param_map[v] = nn.Parameter(
+                    torch.tensor(
+                        torch.nan, dtype=dtype or v.dtype, device=v.device
+                    ).broadcast_to(v.shape)
+                )
+            setattr(m, k, new_v)
+
+    _visit(model_copy)
+    return model_copy
+
+
+def _replace_params(model: nn.Module, params: dict[str, Tensor]) -> None:
+    """Replace parameters of a module that may have low-memory aliases from `deepcopy_with_dummy_params`."""
+    params = params.copy()  # as we modify `params`
+    param_map = {}
+
+    def _visit(m: nn.Module, prefix: tuple[str, ...]) -> None:
+        for name, child in m.named_children():
+            _visit(child, prefix + (name,))
+        for k, v in m.named_parameters(recurse=False):
+            new_v = param_map.get(v)
+            if new_v is None:
+                new_v = param_map[v] = nn.Parameter(
+                    params.pop(".".join(prefix + (k,))).data.clone()
+                )
+                assert (
+                    new_v.shape == v.shape
+                ), f"failed param vs model shape {tuple(new_v.shape)} == {tuple(v.shape)}"
+            setattr(m, k, new_v)
+
+    _visit(model, ())
+    assert not params, f"left-over params: {list(params)}"
 
 
 def _unshard_to_new_model(src: nn.Module, dest: nn.Module) -> None:
@@ -272,23 +317,27 @@ def _unshard_to_new_model(src: nn.Module, dest: nn.Module) -> None:
     Since we can't cleanly convert a fully_shard()ed model to a regular model, we
     copy the parameters to a fresh model.
     """
+
+    def _strip_orig_mod(name: str) -> str:
+        return ".".join([p for p in name.split(".") if p != "_orig_mod"])
+
     for m in src.modules():
         if isinstance(m, fsdp.FSDPModule):
             m.unshard()
-    src_parameters = {_strip_orig_mod(n): p for n, p in src.named_parameters()}
-    dest_parameters = {_strip_orig_mod(n): p for n, p in dest.named_parameters()}
-    assert set(src_parameters) == set(dest_parameters), (
-        "Parameter lists do not match, "
-        f"(src - dest) = {set(src_parameters) - set(dest_parameters)}"
-        f", (dest - src) = {set(dest_parameters) - set(src_parameters)}"
-    )
-    for n, p in dest_parameters.items():
-        p.data[...] = src_parameters[n]
+    _replace_params(dest, {_strip_orig_mod(n): p for n, p in src.named_parameters()})
 
 
 def _bits_per_param(model: nn.Module) -> float:
     # We assume torch.bfloat16, even if not using it, as this was "original precision"
-    return T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
+    try:
+        for m in model.modules():
+            if isinstance(m, fsdp.FSDPModule):
+                m.unshard()
+        return T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
+    finally:
+        for m in model.modules():
+            if isinstance(m, fsdp.FSDPModule):
+                m.reshard()
 
 
 def _lr_schedule_fn(name: LRSchedule, steps: int) -> Callable[[int], float]:
@@ -519,6 +568,7 @@ def _run_worker(run: Run) -> None:
         process_log = _process_model(model, run.test)
         if experiment:
             experiment.summary(**process_log)
+        eval_model = _deepcopy_with_dummy_params(model, dtype=run.exe.compute_dtype)
 
         # Preparation
         exit.enter_context(core.activation_checkpointing_enabled(model))
@@ -572,14 +622,11 @@ def _run_worker(run: Run) -> None:
 
         # Evaluation
 
-        # Convert `reference_model` for use as an unsharded model for final evaluation,
-        # copying the trained parameters into it.
-        if run.exe.compile:
-            reference_model = reference_model._orig_mod
-        _process_model(reference_model, run.test)
-        _unshard_to_new_model(model, reference_model)
-        model = logger.model = reference_model
+        # Copy into `eval_model` for evaluation, as it's risky to use an FSDP
+        # model, which cannot be un-fully-sharded
         del reference_model
+        _unshard_to_new_model(model, eval_model)
+        model = logger.model = eval_model
         if not _is_master():
             return
 
