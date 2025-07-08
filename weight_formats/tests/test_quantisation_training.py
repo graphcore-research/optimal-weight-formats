@@ -121,7 +121,7 @@ def test_convert_and_train() -> None:
     reference = nn.Sequential(
         nn.Linear(64, 512, bias=False),
         nn.RMSNorm((512,)),
-        nn.Linear(512, 64, bias=False),
+        nn.Linear(512, 64, bias=True),
     )
     input = torch.randn(2048, 64)
     with torch.no_grad():

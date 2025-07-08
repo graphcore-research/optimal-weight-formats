@@ -197,12 +197,13 @@ class Weight(nn.Module):
 
 
 class Linear(nn.Module):
-    def __init__(self, weight: Weight):
+    def __init__(self, weight: Weight, bias: nn.Parameter | None):
         super().__init__()
         self.weight = weight
+        self.bias = bias
 
     def forward(self, input: Tensor) -> Tensor:
-        return nn.functional.linear(input, self.weight())
+        return nn.functional.linear(input, self.weight(), self.bias)
 
 
 class Embedding(nn.Module):
@@ -228,12 +229,18 @@ def convert(
         for parent_name, parent in module.named_modules():
             for name, child in list(parent.named_children()):
                 replace_cls = None
+                replace_args = {}
                 if isinstance(child, nn.Linear):
-                    if type(child) != nn.Linear or child.bias is not None:
-                        raise ValueError(
-                            f"Cannot convert {type(child)}(bias={child.bias is not None})"
-                        )
+                    if type(child) != nn.Linear:
+                        raise ValueError(f"Cannot convert {type(child)}")
                     replace_cls = Linear
+                    replace_args = dict(
+                        bias=(
+                            None
+                            if child.bias is None
+                            else nn.Parameter(child.bias.clone())
+                        )
+                    )
 
                 if isinstance(child, nn.Embedding):
                     if type(child) != nn.Embedding or not (
@@ -270,7 +277,7 @@ def convert(
                         weight = shared_weights[child.weight] = Weight(
                             child.weight, fmt, scaling_mode, clip_gradient
                         )
-                    parent.add_module(name, replace_cls(weight))
+                    parent.add_module(name, replace_cls(weight, **replace_args))
 
 
 def get_named_parameters(
