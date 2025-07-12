@@ -4,6 +4,7 @@ __pycache__
 .venv
 .vscode
 
+/local
 /notebooks
 /paper/overleaf
 /out
