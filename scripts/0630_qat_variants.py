@@ -109,18 +109,34 @@ def runs_formats() -> list[EQ.Run]:
             tag="formats",
         )
         for qat_args, train_centroids in [
-            # (dict(scaling_mode="dynamic", clip_gradient=False), False),
-            # (dict(scaling_mode="parameter", clip_gradient=True), False),
+            (dict(scaling_mode="dynamic", clip_gradient=False), False),
+            (dict(scaling_mode="parameter", clip_gradient=True), False),
             (dict(scaling_mode="dynamic", clip_gradient=False), True),
         ]
         for fmt in FORMATS
     ]
 
 
+def runs_scale_up() -> list[EQ.Run]:
+    model = "meta-llama/Llama-3.1-8B"
+    fmt = F.Scaled(3, "t", Q.BFLOAT16, (1, 64), "absmax", args=dict(mode="asymmetric"))
+    return [
+        EQ.Run(
+            EXPERIMENT,
+            model=model,
+            test=EQ.QAT(fmt, "dynamic", clip_gradient=False),
+            train=EQ.TrainingSettings(steps=2**12, batch_size=64, log_interval=128),
+            opt=EQ.OptimiserSettings(lr=lr),
+            exe=EQ.ExecutionSettings(),
+            tag="scale-up",
+        )
+        for lr in [2**-19]
+    ]
+
+
 if __name__ == "__main__":
     # runs = runs_v0()
     # runs = runs_direct_cast()
-    runs = runs_formats()
-    for run in runs:
-        print("#####", run.to_config()["test"]["fmt_str"], run.test.scaling_mode)
-        EQ.run(run)
+    # runs = runs_formats()
+    runs = runs_scale_up()
+    EQ.run_sweep(runs)
