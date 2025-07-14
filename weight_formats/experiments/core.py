@@ -186,12 +186,15 @@ def _dump_error(error: Exception) -> dict[str, Any]:
 
 
 def _get_username() -> str | None:
+    if "ENDUSER" in os.environ:
+        return os.environ["ENDUSER"]
     try:
         arn = boto3.client("sts").get_caller_identity()["Arn"]
         if m := re.search("user/(.+)", arn):
             return m.group(1)
     except botocore.exceptions.NoCredentialsError:
-        return os.environ["USER"]
+        pass
+    return os.environ["USER"]
 
 
 @contextmanager

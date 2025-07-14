@@ -32,6 +32,7 @@ from .. import model_quantisation as M
 from .. import quantisation as Q
 from .. import quantisation_training as T
 from . import core, fisher, token_prediction
+from .internal import submit
 
 CODE_CHANGES = dict(
     compile_disable=["Weight.forward"],
@@ -698,13 +699,19 @@ def run(run: Run, port: int | None = None, devices: list[int] | None = None) -> 
         p.join()
 
 
-def run_sweep(runs: list[Run]) -> None:
-    n_device = torch.cuda.device_count()
+def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
+    devices = torch.cuda.device_count()
     (data_parallel,) = set(run.exe.data_parallel for run in runs)
     assert (
-        n_device % data_parallel == 0
-    ), f"bad sweep: device count {n_device} must be a multiple of run.exe.data_parallel {data_parallel}"
-    n_workers = n_device // data_parallel
+        devices % data_parallel == 0
+    ), f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
+    n_workers = devices // data_parallel
+
+    if dry_run:
+        print("### run_sweep(dry_run=True)", file=sys.stderr)
+        for run in runs:
+            print(f"   {run}", file=sys.stderr)
+        return
 
     # The worker_queue is a list of available worker IDs
     worker_queue = queue.SimpleQueue()
@@ -724,3 +731,26 @@ def run_sweep(runs: list[Run]) -> None:
     with concurrent.futures.ThreadPoolExecutor(n_workers) as pool:
         for run_ in runs:
             pool.submit(_sweep_runner, run_)
+
+
+def submit_sweep(
+    runs: list[Run], devices: int, dry_run: Literal["sweep", "run"] | None = None
+) -> None:
+    (name,) = set(run.experiment for run in runs)
+    (data_parallel,) = set(run.exe.data_parallel for run in runs)
+    assert (
+        devices % data_parallel == 0
+    ), f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
+    sub = submit.Submission(
+        name=name,
+        devices=devices,
+        jobs=[
+            submit.Job(run_sweep, (run_batch,), dict(dry_run=dry_run == "run"))
+            for run_batch in it.batched(runs, devices // data_parallel)
+        ],
+        env=dict(
+            AWS_ACCESS_KEY_ID=os.environ["SWEEP_AWS_ACCESS_KEY_ID"],
+            AWS_SECRET_ACCESS_KEY=os.environ["SWEEP_AWS_SECRET_ACCESS_KEY"],
+        ),
+    )
+    submit.run(sub, dry_run=dry_run == "sweep")
