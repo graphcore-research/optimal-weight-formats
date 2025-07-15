@@ -1,15 +1,16 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
+import collections
 import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import getpass
 import itertools as it
 import math
 import os
 import queue
 import sys
-import collections
 import time
 import unittest.mock
 import warnings
@@ -640,11 +641,14 @@ def _run_worker(run: Run) -> None:
             _save_model(model, run.exe.checkpoint)
 
         experiment.summary(
-            downstream={task.name: evaluate(model, task) for task in run.tasks},
             **logger.validate(),
             bits_per_param=_bits_per_param(model),
             params=T.count_parameters(model),
             duration_train=duration_train,
+        )
+        # separate, in case it fails
+        experiment.summary(
+            downstream={task.name: evaluate(model, task) for task in run.tasks}
         )
 
 
@@ -756,6 +760,12 @@ def submit_sweep(
                 submit.Job(run_sweep, (run_batch,), dict(dry_run=dry_run == "run"))
             )
 
+    hf_cache = (
+        Path("/data")
+        / os.environ.get("ENDUSER", getpass.getuser())
+        / "cache"
+        / "huggingface"
+    )
     sub = submit.Submission(
         name=name,
         devices=devices,
@@ -764,6 +774,8 @@ def submit_sweep(
             AWS_ACCESS_KEY_ID=os.environ["SWEEP_AWS_ACCESS_KEY_ID"],
             AWS_SECRET_ACCESS_KEY=os.environ["SWEEP_AWS_SECRET_ACCESS_KEY"],
             HF_TOKEN=os.environ["SWEEP_HF_TOKEN"],
+            HF_HUB_CACHE=str(hf_cache / "hub"),
+            HF_DATASETS_CACHE=str(hf_cache / "datasets"),
         ),
     )
     submit.run(sub, dry_run=dry_run == "sweep")

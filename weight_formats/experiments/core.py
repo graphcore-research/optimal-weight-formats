@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import datetime
 import decimal
+import getpass
 import itertools as it
 import multiprocessing
 import os
@@ -194,7 +195,7 @@ def _get_username() -> str | None:
             return m.group(1)
     except botocore.exceptions.NoCredentialsError:
         pass
-    return os.environ["USER"]
+    return getpass.getuser()
 
 
 @contextmanager

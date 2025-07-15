@@ -2,6 +2,7 @@
 
 import copy
 import dataclasses
+import getpass
 import os
 import pickle
 import re
@@ -37,7 +38,7 @@ class Job:
 def _user_default() -> str:
     if "ENDUSER" in os.environ:
         return os.environ["ENDUSER"]
-    return os.environ["USER"]
+    return getpass.getuser()
 
 
 def _project_name_default() -> str:
