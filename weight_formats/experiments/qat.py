@@ -709,8 +709,8 @@ def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
 
     if dry_run:
         print("### run_sweep(dry_run=True)", file=sys.stderr)
-        for run in runs:
-            print(f"   {run}", file=sys.stderr)
+        for run_ in runs:
+            print(f"   {run_}", file=sys.stderr)
         return
 
     # The worker_queue is a list of available worker IDs
@@ -741,6 +741,7 @@ def submit_sweep(
     assert (
         devices % data_parallel == 0
     ), f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
+
     sub = submit.Submission(
         name=name,
         devices=devices,
@@ -751,6 +752,7 @@ def submit_sweep(
         env=dict(
             AWS_ACCESS_KEY_ID=os.environ["SWEEP_AWS_ACCESS_KEY_ID"],
             AWS_SECRET_ACCESS_KEY=os.environ["SWEEP_AWS_SECRET_ACCESS_KEY"],
+            HF_TOKEN=os.environ["SWEEP_HF_TOKEN"],
         ),
     )
     submit.run(sub, dry_run=dry_run == "sweep")

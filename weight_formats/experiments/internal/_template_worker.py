@@ -11,6 +11,8 @@ COMMIT: str = __TEMPLATE_COMMIT__  # type: ignore
 RUNNER: str = __TEMPLATE_RUNNER__  # type: ignore
 JOB: bytes = __TEMPLATE_JOB__  # type: ignore
 
+APT_PACKAGES = ["build-essential", "git", "python3-dev"]
+
 
 def sh(cmd: list[str], input: bytes | None = None) -> None:
     try:
@@ -23,6 +25,8 @@ def sh(cmd: list[str], input: bytes | None = None) -> None:
 
 if __name__ == "__main__":
     # Setup
+    sh(["apt", "update"])
+    sh(["apt", "install", "-y", *APT_PACKAGES])
     if not Path(LOCAL_PATH).exists():
         sh(["git", "clone", REPO, LOCAL_PATH])
     os.chdir(LOCAL_PATH)
