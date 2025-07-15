@@ -9,6 +9,7 @@ import math
 import os
 import queue
 import sys
+import collections
 import time
 import unittest.mock
 import warnings
@@ -306,9 +307,9 @@ def _replace_params(model: nn.Module, params: dict[str, Tensor]) -> None:
                 new_v = param_map[v] = nn.Parameter(
                     params.pop(".".join(prefix + (k,))).data.clone()
                 )
-                assert (
-                    new_v.shape == v.shape
-                ), f"failed param vs model shape {tuple(new_v.shape)} == {tuple(v.shape)}"
+                assert new_v.shape == v.shape, (
+                    f"failed param vs model shape {tuple(new_v.shape)} == {tuple(v.shape)}"
+                )
             setattr(m, k, new_v)
 
     _visit(model, ())
@@ -702,9 +703,9 @@ def run(run: Run, port: int | None = None, devices: list[int] | None = None) -> 
 def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
     devices = torch.cuda.device_count()
     (data_parallel,) = set(run.exe.data_parallel for run in runs)
-    assert (
-        devices % data_parallel == 0
-    ), f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
+    assert devices % data_parallel == 0, (
+        f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
+    )
     n_workers = devices // data_parallel
 
     if dry_run:
@@ -737,18 +738,28 @@ def submit_sweep(
     runs: list[Run], devices: int, dry_run: Literal["sweep", "run"] | None = None
 ) -> None:
     (name,) = set(run.experiment for run in runs)
-    (data_parallel,) = set(run.exe.data_parallel for run in runs)
-    assert (
-        devices % data_parallel == 0
-    ), f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
+
+    # Only runs with the same data_parallel setting can run_sweep() together
+    jobs = []
+    run_groups = collections.defaultdict(list)
+    for run in runs:
+        run_groups[run.exe.data_parallel].append(run)
+    for data_parallel in sorted(run_groups):
+        assert devices % data_parallel == 0, (
+            f"bad sweep: device count {devices} must be a multiple of"
+            f" run.exe.data_parallel {data_parallel}"
+        )
+        for run_batch in it.batched(
+            run_groups[data_parallel], devices // data_parallel
+        ):
+            jobs.append(
+                submit.Job(run_sweep, (run_batch,), dict(dry_run=dry_run == "run"))
+            )
 
     sub = submit.Submission(
         name=name,
         devices=devices,
-        jobs=[
-            submit.Job(run_sweep, (run_batch,), dict(dry_run=dry_run == "run"))
-            for run_batch in it.batched(runs, devices // data_parallel)
-        ],
+        jobs=jobs,
         env=dict(
             AWS_ACCESS_KEY_ID=os.environ["SWEEP_AWS_ACCESS_KEY_ID"],
             AWS_SECRET_ACCESS_KEY=os.environ["SWEEP_AWS_SECRET_ACCESS_KEY"],
