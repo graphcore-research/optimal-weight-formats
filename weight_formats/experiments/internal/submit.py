@@ -141,7 +141,7 @@ def _generate_scripts(sub: Submission) -> Iterable[Path]:
             Path(__file__).parent / "_template_job.yaml",
             job_yaml,
             dict(
-                __TEMPLATE_NAME__=f"{sub.user}-{sub.project_name}-{config_path.name}-{job_id}",
+                __TEMPLATE_NAME__=f"{sub.user}-{config_path.name}-{job_id}",
                 __TEMPLATE_USER__=sub.user,
                 __TEMPLATE_COMMAND__=["python", str(job_py.absolute())],
                 __TEMPLATE_ENV__=[dict(name=k, value=v) for k, v in sub.env.items()],
