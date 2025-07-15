@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __TEMPLATE_NAME__
+  labels:
+    user: __TEMPLATE_USER__
+    kueue.x-k8s.io/queue-name: unified
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      securityContext: { fsGroup: 0 }
+      restartPolicy: Never
+      tolerations:
+        - key: nvidia.com/gpu
+          value: "true"
+          operator: Equal
+          effect: NoSchedule
+      volumes:
+        - name: data
+          hostPath: { path: /data }
+        - name: devshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+      containers:
+        - name: workload
+          image: pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
+          command: __TEMPLATE_COMMAND__
+          env: __TEMPLATE_ENV__
+          resources:
+            requests:
+              nvidia.com/gpu: __TEMPLATE_GPUS__
+              cpu: __TEMPLATE_CPUS__
+              memory: __TEMPLATE_MEMORY__
+            limits:
+              nvidia.com/gpu: __TEMPLATE_GPUS__
+              cpu: __TEMPLATE_CPUS__
+              memory: __TEMPLATE_MEMORY__
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: devshm
+              mountPath: /dev/shm

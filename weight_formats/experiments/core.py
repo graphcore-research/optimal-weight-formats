@@ -66,7 +66,7 @@ def iter_dict_product(
     for i, values in enumerate(values_list):
         if progress:
             print(
-                f"# [{i+1}/{len(values_list)}] {dict(zip(axes, values))}",
+                f"# [{i + 1}/{len(values_list)}] {dict(zip(axes, values))}",
                 file=sys.stderr,
             )
         yield {**config, **dict(zip(axes, values))}
@@ -186,12 +186,15 @@ def _dump_error(error: Exception) -> dict[str, Any]:
 
 
 def _get_username() -> str | None:
+    if "ENDUSER" in os.environ:
+        return os.environ["ENDUSER"]
     try:
         arn = boto3.client("sts").get_caller_identity()["Arn"]
         if m := re.search("user/(.+)", arn):
             return m.group(1)
     except botocore.exceptions.NoCredentialsError:
-        return os.environ["USER"]
+        pass
+    return os.environ["USER"]
 
 
 @contextmanager
@@ -431,8 +434,9 @@ class Experiment:
             meta=dict(
                 status="running",
                 time=datetime.datetime.now().isoformat(),
-                user=_get_username(),
                 commit=_git_head(),
+                user=_get_username(),
+                hostname=os.environ.get("HOSTNAME", ""),
                 **_device_info(),
             ),
             summary={},
