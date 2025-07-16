@@ -739,7 +739,10 @@ def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
 
 
 def submit_sweep(
-    runs: list[Run], devices: int, dry_run: Literal["sweep", "run"] | None = None
+    runs: list[Run],
+    devices: int = 8,
+    priority: submit.Priority = "medium",
+    dry_run: Literal["sweep", "run"] | None = None,
 ) -> None:
     (name,) = set(run.experiment for run in runs)
 
@@ -777,5 +780,6 @@ def submit_sweep(
             HF_HUB_CACHE=str(hf_cache / "hub"),
             HF_DATASETS_CACHE=str(hf_cache / "datasets"),
         ),
+        priority=priority,
     )
     submit.run(sub, dry_run=dry_run == "sweep")

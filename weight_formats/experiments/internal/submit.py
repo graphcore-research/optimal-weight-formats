@@ -10,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Literal, TypeAlias
 
 
 def _sh(cmd: list[str], input: bytes | None = None) -> None:
@@ -55,6 +55,9 @@ def _commit_default() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode()
 
 
+Priority: TypeAlias = Literal["low", "medium", "high"]
+
+
 @dataclass
 class Submission:
     name: str
@@ -65,6 +68,7 @@ class Submission:
     user: str = dataclasses.field(default_factory=_user_default)
     project_name: str = dataclasses.field(default_factory=_project_name_default)
     commit: str = dataclasses.field(default_factory=_commit_default)
+    priority: Priority = "medium"
     # Templates
     shared_folder: str = "/data/{user}"
     shared_repo: str = "{shared_folder}/{project_name}/repo.git"
@@ -144,6 +148,9 @@ def _generate_scripts(sub: Submission) -> Iterable[Path]:
             dict(
                 __TEMPLATE_NAME__=f"{sub.user}-{config_path.name}-{job_id}",
                 __TEMPLATE_USER__=sub.user,
+                __TEMPLATE_PRIORITY__=dict(
+                    low="low-priority", medium="", high="high-priority"
+                )[sub.priority],
                 __TEMPLATE_COMMAND__=["python", str(job_py.absolute())],
                 __TEMPLATE_ENV__=[dict(name=k, value=v) for k, v in sub.env.items()],
                 __TEMPLATE_GPUS__=sub.devices,

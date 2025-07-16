@@ -5,6 +5,7 @@ metadata:
   labels:
     user: __TEMPLATE_USER__
     kueue.x-k8s.io/queue-name: unified
+    kueue.x-k8s.io/priority-class: __TEMPLATE_PRIORITY__
 spec:
   backoffLimit: 0
   template:
