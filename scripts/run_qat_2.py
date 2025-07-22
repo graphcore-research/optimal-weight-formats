@@ -5,11 +5,11 @@ import weight_formats.fit as F
 import weight_formats.quantisation as Q
 
 if __name__ == "__main__":
-    fmt = F.Scaled(4, "int", Q.BFLOAT16, (1, 64), "absmax", "moments")
+    fmt = F.Scaled(3, "int", Q.BFLOAT16, (1, 64), "absmax")
     runs = [
         EQ.Run(
             "dev",
-            model="meta-llama/Llama-3.2-1B",
+            model="meta-llama/Llama-3.2-3B",
             test=EQ.QAT(
                 fmt,
                 scaling_mode="dynamic",
@@ -17,12 +17,12 @@ if __name__ == "__main__":
             ),
             train=EQ.TrainingSettings(
                 steps=16,
-                batch_size=16,
+                batch_size=64,
                 log_interval=8,
-                valid_sequences=2,
+                valid_sequences=64,
             ),
             opt=EQ.OptimiserSettings(lr=2**-18),
-            exe=EQ.ExecutionSettings(data_parallel=2),
+            exe=EQ.ExecutionSettings(data_parallel=8),
             tasks=(EQ.Task("arc_easy:mc"),),
         )
     ]

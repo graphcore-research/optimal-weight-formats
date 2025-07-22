@@ -27,10 +27,10 @@ PROJECT_DIR="$(dirname $(dirname $(readlink -f ${BASH_SOURCE[0]})))"
 [ -L ~/work/.venv ] || ln -s ~/weight-formats/venv ~/work/.venv
 
 mkdir -p ~/weight-formats/out
-aws s3 sync s3://graphcore-research/2025-04-block-formats/20250423-fisher/ out/20250423-fisher/
+# aws s3 sync s3://graphcore-research/2025-04-block-formats/20250423-fisher/ out/20250423-fisher/
 
 python3 -m venv ~/weight-formats/venv
 # python3 -m venv --system-site-packages ~/weight-formats/venv  # GH200
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-base.txt
 echo 'export PYTHONPATH="${PYTHONPATH}:${HOME}/work"' >> .venv/bin/activate

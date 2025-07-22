@@ -334,13 +334,18 @@ def _unshard_to_new_model(src: nn.Module, dest: nn.Module) -> None:
 
 
 def _bits_per_param(model: nn.Module) -> float:
+    print("_bits_per_param()", file=sys.stderr, flush=True)
     # We assume torch.bfloat16, even if not using it, as this was "original precision"
     try:
         for m in model.modules():
             if isinstance(m, fsdp.FSDPModule):
+                print("unshard()", file=sys.stderr, flush=True)
                 m.unshard()
+                print("finish unshard()", file=sys.stderr, flush=True)
+        print("count_bits()", file=sys.stderr, flush=True)
         return T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
     finally:
+        print("finish _bits_per_param()", file=sys.stderr, flush=True)
         for m in model.modules():
             if isinstance(m, fsdp.FSDPModule):
                 m.reshard()
@@ -509,10 +514,14 @@ class _Logger:
         return {}
 
     def _validate_and_log(self) -> None:
+        print("_validate_and_log()", file=sys.stderr, flush=True)
         # Compute statistics
         if self.data_parallel > 1:
+            print("all_reduce(loss)", file=sys.stderr, flush=True)
             torch.distributed.all_reduce(self._total_loss)
+            print("all_reduce(count)", file=sys.stderr, flush=True)
             torch.distributed.all_reduce(self._total_count)
+            print("done", file=sys.stderr, flush=True)
         t1 = time.time()  # don't count validation time
         if self._step == self._logged_step:
             self._log.loss.append(None)
@@ -527,6 +536,7 @@ class _Logger:
             self._log.setdefault(k, []).append(v)
 
         # Write logs
+        print("write logs", file=sys.stderr, flush=True)
         if _is_master():
             print(
                 f"{self._step:>04}:  "
@@ -541,10 +551,12 @@ class _Logger:
             self.experiment.summary(train=self._log)
 
         # Reset
+        print("reset", file=sys.stderr, flush=True)
         self._total_loss.zero_()
         self._total_count.zero_()
         self._t0 = time.time()
         self._logged_step = self._step
+        print("finish _validate_and_log()", file=sys.stderr, flush=True)
 
     def log(self, loss: Tensor, count: Tensor) -> None:
         self._total_loss.add_(loss.float())
@@ -555,6 +567,7 @@ class _Logger:
 
 
 def _run_worker(run: Run) -> None:
+    print("_run_worker()", file=sys.stderr, flush=True)
     with contextlib.ExitStack() as exit:
         if _is_master():
             print(run.to_config(), file=sys.stderr)
@@ -567,6 +580,7 @@ def _run_worker(run: Run) -> None:
             exit.enter_context(core.cuda_memory_history(Path(run.exe.memory_profile)))
 
         # Loading
+        print("load", file=sys.stderr, flush=True)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
             run.model, torch_dtype=run.exe.reference_dtype
         )
@@ -577,6 +591,7 @@ def _run_worker(run: Run) -> None:
         eval_model = _deepcopy_with_dummy_params(model, dtype=run.exe.compute_dtype)
 
         # Preparation
+        print("prep", file=sys.stderr, flush=True)
         model.to(run.exe.params_dtype)
         exit.enter_context(core.activation_checkpointing_enabled(model))
         if torch.distributed.is_initialized():
@@ -595,6 +610,7 @@ def _run_worker(run: Run) -> None:
             _compile_transformer_layers(model, run.exe.compile)
 
         # Training
+        print("train", file=sys.stderr, flush=True)
         train_t0 = time.time()
         logger = _Logger(
             log_interval=run.train.log_interval,
@@ -605,6 +621,7 @@ def _run_worker(run: Run) -> None:
             model=model,
         )
         if run.train.steps:
+            print("train steps", file=sys.stderr, flush=True)
             opt, schedule = _create_optimiser(model, run.opt, run.train.steps)
             batches = _iter_batches(
                 run.train.dataset,
@@ -614,6 +631,7 @@ def _run_worker(run: Run) -> None:
                 data_parallel=run.exe.data_parallel,
             )
             for batch in it.islice(batches, run.train.steps):
+                print("step()", file=sys.stderr, flush=True)
                 opt.zero_grad()
                 loss = _compute_kl_loss(model, reference_model, batch)
                 loss.backward()
@@ -628,6 +646,7 @@ def _run_worker(run: Run) -> None:
         duration_train = time.time() - train_t0
 
         # Evaluation
+        print("eval", file=sys.stderr, flush=True)
 
         # Copy into `eval_model` for evaluation, as it's risky to use an FSDP
         # model, which cannot be un-fully-sharded
@@ -650,6 +669,7 @@ def _run_worker(run: Run) -> None:
         experiment.summary(
             downstream={task.name: evaluate(model, task) for task in run.tasks}
         )
+    print("finish _run_worker()", file=sys.stderr, flush=True)
 
 
 # Distributed training
@@ -684,6 +704,7 @@ def _init_and_run_worker(
 
 
 def run(run: Run, port: int | None = None, devices: list[int] | None = None) -> None:
+    print("run()", file=sys.stderr, flush=True)
     if port is None:
         port = torch.randint(10000, 20000, ()).item()
     processes: list[multiprocessing.Process] = []
@@ -702,6 +723,7 @@ def run(run: Run, port: int | None = None, devices: list[int] | None = None) -> 
         processes.append(p)
     for p in processes:
         p.join()
+    print("finished run()", file=sys.stderr, flush=True)
 
 
 def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
@@ -735,7 +757,10 @@ def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
 
     with concurrent.futures.ThreadPoolExecutor(n_workers) as pool:
         for run_ in runs:
+            print("submit run", file=sys.stderr, flush=True)
             pool.submit(_sweep_runner, run_)
+        pool.shutdown()
+    print("done", file=sys.stderr, flush=True)
 
 
 def submit_sweep(
