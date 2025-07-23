@@ -732,6 +732,7 @@ def submit_sweep(
     devices: int = 8,
     priority: submit.Priority = "medium",
     dry_run: Literal["sweep", "run"] | None = None,
+    max_jobs: int | None = None,
 ) -> None:
     (name,) = set(run.experiment for run in runs)
 
@@ -740,14 +741,21 @@ def submit_sweep(
     run_groups = collections.defaultdict(list)
     for run in runs:
         run_groups[run.exe.data_parallel].append(run)
-    for data_parallel in sorted(run_groups):
-        assert devices % data_parallel == 0, (
+        assert devices % run.exe.data_parallel == 0, (
             f"bad sweep: device count {devices} must be a multiple of"
             f" run.exe.data_parallel {data_parallel}"
         )
-        for run_batch in it.batched(
-            run_groups[data_parallel], devices // data_parallel
-        ):
+    assert (
+        max_jobs is None or len(run_groups) == 1
+    ), "Cannot use max_jobs with multiple data_parallel settings"
+
+    for data_parallel in sorted(run_groups):
+        runs = run_groups[data_parallel]
+        if max_jobs is None:
+            run_batch_size = devices // data_parallel
+        else:
+            run_batch_size = math.ceil(len(runs) / max_jobs)
+        for run_batch in it.batched(runs, run_batch_size):
             jobs.append(
                 submit.Job(run_sweep, (run_batch,), dict(dry_run=dry_run == "run"))
             )
