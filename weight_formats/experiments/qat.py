@@ -580,6 +580,7 @@ def _run_worker(run: Run) -> None:
         model.to(run.exe.params_dtype)
         exit.enter_context(core.activation_checkpointing_enabled(model))
         if torch.distributed.is_initialized():
+            _fully_shard_model(reference_model)
             _fully_shard_model(
                 model,
                 mp_policy=fsdp.MixedPrecisionPolicy(param_dtype=run.exe.compute_dtype),
@@ -589,9 +590,7 @@ def _run_worker(run: Run) -> None:
             assert run.exe.compute_dtype == run.exe.params_dtype
         if run.exe.compile:
             torch._dynamo.config.cache_size_limit = 64
-            reference_model = torch.compile(
-                reference_model, mode=run.exe.compile, fullgraph=True
-            )
+            _compile_transformer_layers(reference_model, run.exe.compile)
             _compile_transformer_layers(model, run.exe.compile)
 
         # Training
@@ -725,8 +724,7 @@ def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
             worker_queue.put(worker_id)
 
     with concurrent.futures.ThreadPoolExecutor(n_workers) as pool:
-        for run_ in runs:
-            pool.submit(_sweep_runner, run_)
+        list(pool.map(_sweep_runner, runs))
 
 
 def submit_sweep(

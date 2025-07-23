@@ -90,7 +90,9 @@ def activation_checkpointing_enabled(
             if isinstance(m, transformers.modeling_utils.PreTrainedModel):
                 assert not m.training
                 m.training = True
-        model.gradient_checkpointing_enable()
+        # Note: use_reentrant=False selects an implementation that is compatible with
+        # FSDP (the reentrant implementation unshards the model in the recomp pass)
+        model.gradient_checkpointing_enable(dict(use_reentrant=False))
         yield model
     finally:
         model.gradient_checkpointing_disable()

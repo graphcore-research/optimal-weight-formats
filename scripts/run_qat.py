@@ -5,7 +5,7 @@ import weight_formats.fit as F
 import weight_formats.quantisation as Q
 
 if __name__ == "__main__":
-    fmt = F.Scaled(4, "int", Q.BFLOAT16, (1, 64), "absmax", "moments")
+    fmt = F.Scaled(3, "t", Q.BFLOAT16, (1, 64), "absmax", "moments")
     runs = [
         EQ.Run(
             "dev",
@@ -17,7 +17,7 @@ if __name__ == "__main__":
             ),
             train=EQ.TrainingSettings(
                 steps=16,
-                batch_size=16,
+                batch_size=64,
                 log_interval=8,
                 valid_sequences=2,
             ),
