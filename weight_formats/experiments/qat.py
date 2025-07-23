@@ -308,9 +308,9 @@ def _replace_params(model: nn.Module, params: dict[str, Tensor]) -> None:
                 new_v = param_map[v] = nn.Parameter(
                     params.pop(".".join(prefix + (k,))).data.clone()
                 )
-                assert new_v.shape == v.shape, (
-                    f"failed param vs model shape {tuple(new_v.shape)} == {tuple(v.shape)}"
-                )
+                assert (
+                    new_v.shape == v.shape
+                ), f"failed param vs model shape {tuple(new_v.shape)} == {tuple(v.shape)}"
             setattr(m, k, new_v)
 
     _visit(model, ())
@@ -675,41 +675,32 @@ def _init_distributed(**args: Any) -> Iterable[None]:
 
 
 def _init_and_run_worker(
-    run: Run, devices: list[int] | None, dist_kwargs: dict[str, Any]
+    rank: int, run: Run, devices: list[int] | None, init_method: str
 ) -> Any:
     if devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, devices))
-    with _init_distributed(**dist_kwargs):
+    with _init_distributed(
+        rank=rank, world_size=run.exe.data_parallel, init_method=init_method
+    ):
         return _run_worker(run)
 
 
 def run(run: Run, port: int | None = None, devices: list[int] | None = None) -> None:
     if port is None:
         port = torch.randint(10000, 20000, ()).item()
-    processes: list[multiprocessing.Process] = []
-    for n in range(run.exe.data_parallel):
-        dist_kwargs = dict(
-            rank=n,
-            world_size=run.exe.data_parallel,
-            init_method=f"tcp://localhost:{port}",
-        )
-        p = multiprocessing.Process(
-            target=_init_and_run_worker,
-            args=(run, devices, dist_kwargs),
-            name=f"dist-worker-{n}",
-        )
-        p.start()
-        processes.append(p)
-    for p in processes:
-        p.join()
+    multiprocessing.spawn(
+        _init_and_run_worker,
+        args=(run, devices, f"tcp://localhost:{port}"),
+        nprocs=run.exe.data_parallel,
+    )
 
 
 def run_sweep(runs: list[Run], dry_run: bool = False) -> None:
     devices = torch.cuda.device_count()
     (data_parallel,) = set(run.exe.data_parallel for run in runs)
-    assert devices % data_parallel == 0, (
-        f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
-    )
+    assert (
+        devices % data_parallel == 0
+    ), f"bad sweep: device count {devices} must be a multiple of run.exe.data_parallel {data_parallel}"
     n_workers = devices // data_parallel
 
     if dry_run:

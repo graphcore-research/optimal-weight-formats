@@ -1,7 +1,7 @@
 Dev.ipynb
 __pycache__
 .results
-.venv
+.venv*
 .vscode
 
 /local
