@@ -1,3 +1,6 @@
+set -e
+set -o xtrace
+
 apt update
 apt install -y build-essential git-core
 
