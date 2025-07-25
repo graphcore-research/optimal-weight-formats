@@ -5,6 +5,7 @@ import concurrent.futures
 import contextlib
 import copy
 import dataclasses
+import gc
 import getpass
 import itertools as it
 import math
@@ -633,6 +634,9 @@ def _run_worker(run: Run) -> None:
         del reference_model
         _unshard_to_new_model(model, eval_model)
         model = logger.model = eval_model
+        # Required to clean up `reference_model` and old `model`
+        gc.collect()
+        torch.cuda.empty_cache()
         if not _is_master():
             return
 
