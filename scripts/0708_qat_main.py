@@ -138,9 +138,9 @@ def runs_bits_lr_8b() -> list[EQ.Run]:
 
 
 def runs_qat_v2() -> list[EQ.Run]:
-    def get_lr(model: str, fmt: F.Scaled) -> float:
-        model_loglr_3b = {"1B": -17, "3B": -17, "8B": -18}[model.split("-")[-1]]
-        return 2 ** (model_loglr_3b - fmt.element_bits + 3)
+    def get_lr(fmt: F.Scaled) -> float:
+        # model_loglr_3b = {"1B": -17, "3B": -17, "8B": -17}[model.split("-")[-1]]
+        return 2 ** (-17 - fmt.element_bits + 3)
 
     return [
         EQ.Run(
@@ -148,9 +148,11 @@ def runs_qat_v2() -> list[EQ.Run]:
             model=model,
             test=EQ.QAT(fmt, scaling_mode="dynamic", clip_gradient=False),
             train=EQ.TrainingSettings(steps=8192, batch_size=64, log_interval=128),
-            opt=EQ.OptimiserSettings(lr=get_lr(model, fmt)),
-            exe=EQ.ExecutionSettings(data_parallel=8),
-            tag="qat",
+            opt=EQ.OptimiserSettings(lr=get_lr(fmt)),
+            exe=EQ.ExecutionSettings(
+                data_parallel={"1B": 4, "3B": 4, "8B": 8}[model.split("-")[-1]]
+            ),
+            tag="qat-v2",
         )
         for model in MODELS
         for fmt in FORMATS
@@ -169,7 +171,7 @@ if __name__ == "__main__":
 
     for run in runs:
         print(
-            f"##### {run.model}  {getattr(run.test, 'fmt', None)}  2**{math.log2(run.opt.lr)}"
+            f"##### {run.model}  {getattr(run.test, 'fmt', None)}  2**{math.log2(run.opt.lr)}  DP={run.exe.data_parallel}"
         )
     print("#####", len(runs), "total")
 
