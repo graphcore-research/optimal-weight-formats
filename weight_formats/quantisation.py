@@ -466,7 +466,7 @@ class VectorLUTFormat(ScalarFormat):
             torch.tensor(self.values, device=x.device, dtype=torch.float32)
         )
         idx = _nearest_neighbour(x.view(-1, self.dim), values)
-        return values[idx].view(x.shape)
+        return values[idx].view(x.shape).to(x.dtype)
 
 
 # Lloyd-Max
