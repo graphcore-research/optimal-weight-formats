@@ -224,7 +224,7 @@ def _scaled_element_format(
     if element_family == "lloyd_max" and vq_length:
         # Train a VQ Lloyd-Max quantiser on the normalised tensor
         args = args.copy()
-        args.setdefault("threshold", 1e-3)
+        args.setdefault("threshold", 1e-2)  # as training is expensive
         # Note: report the range consistently with training, not based on the actual absmax
         tensor, _ = normalised((-1, 1))
         return Q.vlut_lloyd_max(
