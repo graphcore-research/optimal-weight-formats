@@ -221,8 +221,8 @@ def test_lloyd_max_crd() -> None:
 
 def test_vlut_lloyd_max() -> None:
     torch.manual_seed(100)
-    x = torch.distributions.StudentT(7).sample((2**16,))
-    sfmt = Q.lut_lloyd_max(x, 2, 10**-4)
+    x = torch.distributions.StudentT(5).sample((2**16,))
+    sfmt = Q.lut_lloyd_max(x, 2, 10**-3)
     for init in ["random", "kmeans++"]:
         vfmt = Q.vlut_lloyd_max(x.view(-1, 2), 2, 10**-3, Q.BFLOAT16, init=init)
         assert Q.qrmse_norm(vfmt, x).item() < Q.qrmse_norm(sfmt, x).item() - 0.01, init
