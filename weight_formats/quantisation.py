@@ -376,13 +376,106 @@ class LUTFormat(ScalarFormat):
         return values[self.to_idx(x)]
 
 
+NEAREST_NEIGHBOUR_DEFAULT_MAX_BYTES = 8 * 2**30
+
+
+def _nearest_neighbour(
+    tensor: Tensor,
+    centroids: Tensor,
+    max_bytes: float | None = NEAREST_NEIGHBOUR_DEFAULT_MAX_BYTES,
+    out: Tensor | None = None,
+) -> Tensor:
+    if out is None:
+        out = torch.empty(tensor.shape[0], device=tensor.device, dtype=torch.int64)
+    chunk_size = (
+        tensor.shape[0]
+        if max_bytes is None
+        else int(max_bytes / (centroids.itemsize * centroids.shape[0]))
+    )
+    for i in builtins.range(0, tensor.shape[0], chunk_size):
+        chunk = slice(i, min(tensor.shape[0], i + chunk_size))
+        torch.argmin(
+            torch.cdist(tensor[chunk].to(centroids.dtype), centroids),
+            -1,
+            out=out[chunk],
+        )
+    return out
+
+
+@dataclass
+class VectorLUTFormat(ScalarFormat):
+    """A Vector Quantisation (VQ) format via lookup table.
+
+    Note that this is not truly a scalar format (and does not support .bits), but
+    is marked as a `ScalarFormat` so that it can be used with `LinearScalingFormat`.
+    """
+
+    values: tuple[tuple[float, ...], ...]
+    element_type: ScalarFormat
+    name: str
+    _range: tuple[float, float]
+    _type: str = "vlut"
+
+    @classmethod
+    def create(
+        cls,
+        values: tuple[float, ...] | Tensor,
+        element_type: ScalarFormat,
+        name: str,
+        range: tuple[float, float] | None = None,
+    ) -> "VectorLUTFormat":
+        values = values.tolist() if isinstance(values, Tensor) else values
+        if range is None:
+            transposed = tuple(zip(*values))
+            range = (max(min(t) for t in transposed), min(max(t) for t in transposed))
+        return cls(values=values, element_type=element_type, name=name, _range=range)
+
+    def __post_init__(self) -> None:
+        self.values = tuple(map(tuple, self.values))
+        self._range = tuple(self._range)
+
+    def __str__(self) -> str:
+        return f"VLUT{int(math.ceil(self.index_bits))}x{self.dim}[{self.name}]"
+
+    @property
+    def range(self) -> tuple[float, float]:
+        return self._range
+
+    @property
+    def dim(self) -> int:
+        return len(self.values[0])
+
+    @property
+    def index_bits(self) -> float:
+        return math.log2(len(self.values)) / self.dim
+
+    @property
+    def bits(self) -> float:
+        raise NotImplementedError(
+            "VectorLUTFormat does not implement `bits`,"
+            " due to the non-negligible table size."
+        )
+
+    def count_bits(self, shape: Shape) -> int:
+        idx_bits = math.prod(shape) / self.dim * math.log2(len(self.values))
+        table_bits = self.element_type.count_bits((len(self.values), self.dim))
+        return idx_bits + table_bits
+
+    def quantise(self, x: Tensor) -> Tensor:
+        values = self.element_type.quantise(
+            torch.tensor(self.values, device=x.device, dtype=torch.float32)
+        )
+        idx = _nearest_neighbour(x.view(-1, self.dim), values)
+        return values[idx].view(x.shape)
+
+
 # Lloyd-Max
 
 
 LloydMaxInit: TypeAlias = Union[
     Tensor,
     tuple[Literal["uniform_rms"], float],
-    Literal["uniform_minmax", "kmeans++", "cuberoot"],
+    Literal["uniform_minmax", "random", "kmeans++", "cuberoot"],
 ]
 
 
@@ -409,6 +502,8 @@ def _lloyd_max_init(
             device=tensor.device,
             dtype=tensor.dtype,
         )
+    if init == "random":
+        return tensor[:codepoints].clone()  # already shuffled
     if init == "kmeans++":
         s = tensor[: int(2**20)]
         midpoints = torch.empty(codepoints, device=s.device, dtype=s.dtype)
@@ -509,6 +604,80 @@ def lut_lloyd_max(
             n *= 2
     assert (midpoints[:-1] <= midpoints[1:]).all().item()
     return LUTFormat.create(midpoints, "LM", range=range)
+
+
+def _vector_lloyd_max_init(
+    init: Literal["random", "kmeans++"], tensor: Tensor, n_centroids: int
+) -> Tensor:
+    if init == "random":
+        return tensor[:n_centroids].clone()
+    elif init == "kmeans++":
+        s = tensor[: int(2**20)]
+        p = torch.ones_like(s[:, 0])
+        centroids = torch.empty(
+            (n_centroids, s.shape[1]), device=s.device, dtype=s.dtype
+        )
+        step = max(1, n_centroids // 64)
+        for i in range(0, n_centroids, step):
+            n = min(step, n_centroids - i)
+            centroids[i : i + n] = s[torch.multinomial(p / p.sum(), n)]
+            idx = _nearest_neighbour(s, centroids[: i + n])
+            p = (s - centroids[idx]).pow(2).sum(-1)
+        return centroids
+    else:
+        raise ValueError(f"_vector_lloyd_max_init method {init!r} is unknown")
+
+
+def vlut_lloyd_max(
+    tensor: Tensor,
+    bits: float,
+    threshold: float,
+    element_type: ScalarFormat,
+    *,
+    range: tuple[float, float] | None = None,
+    init: Literal["random", "kmeans++"] = "kmeans++",
+    incremental: bool = True,
+    dtype: torch.dtype | None = None,
+    progress: bool = False,
+) -> VectorLUTFormat:
+    """Run Lloyd-Max to train a vector quantiser.
+
+    tensor -- (n, d) -- for a VQ of dimension `d`
+    """
+    _, dim = tensor.shape
+
+    # Preparation: shuffle, truncate, cast, get init
+    idx = torch.randperm(tensor.shape[0], device=tensor.device, dtype=torch.int32)
+    tensor = tensor[idx]
+    if dtype is None:
+        # Very large tensors have stability problems due the float32
+        # mantissa length, so default to float64
+        dtype = torch.float32 if tensor.nelement() <= 2**26 else torch.float64
+    tensor = tensor.to(dtype)
+    centroids = _vector_lloyd_max_init(init, tensor, int(round(2 ** (bits * dim))))
+
+    # K-means iteration
+    idx = torch.empty(tensor.shape[0], device=tensor.device, dtype=torch.int64)
+    last_idx = torch.empty_like(idx)
+    n = 2**20 if incremental else tensor.shape[0]
+    tqdm_ = tqdm.tqdm(it.count(), disable=not progress)
+    for _ in tqdm_:
+        last_idx[:n] = idx[:n]
+        _nearest_neighbour(tensor[:n], centroids, out=idx[:n])
+        centroids.scatter_reduce_(
+            0,
+            idx[:n, None].expand(-1, dim),
+            tensor[:n],
+            "mean",
+            include_self=False,
+        )
+        idx_change = (last_idx[:n] != idx[:n]).float().mean().item()
+        tqdm_.set_postfix_str(f"{idx_change:.1e}")
+        if idx_change <= threshold:
+            if tensor.nelement() <= n:
+                break
+            n *= 2
+    return VectorLUTFormat.create(centroids.tolist(), element_type, "LM", range=range)
 
 
 # Scalar format utilities

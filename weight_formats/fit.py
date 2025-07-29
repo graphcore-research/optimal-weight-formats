@@ -39,12 +39,15 @@ class Scaled:
     sparse_ratio: float = 0
     # If a tuple: (compressor, training_compressor)
     compressor: Q.Compressor | tuple[Q.Compressor, Q.Compressor] | None = None
+    vq_length: int | None = None
+    vq_format: Q.ScalarFormat | None = None
     rotation: int | None = None
     args: dict[str, Any] = dataclasses.field(default_factory=lambda: {})
 
     _type: str = "fit_scaled"
 
     def __str__(self) -> str:
+        vq = f"x{self.vq_length}-{self.vq_format}" if self.vq_length else ""
         block = ",".join("*" if g is None else str(g) for g in self.block_shape)
         compress = ""
         if self.compressor:
@@ -68,7 +71,7 @@ class Scaled:
             else ""
         )
         return (
-            f"{self.element_bits:.3g}b-{self.element_family}{args}{compress}"
+            f"{self.element_bits:.3g}b{vq}-{self.element_family}{args}{compress}"
             f"{{{block}:{self.scale_format}:{self.scaling}:{self.scaling_match}}}{rotation}{sparse}"
         )
 
@@ -81,6 +84,8 @@ class Scaled:
              scaling=rms optimises format scale.
         """
         if self.compressor is not None:
+            return False
+        if self.element_family == "lloyd_max" and self.vq_length is not None:
             return False
         if self.element_family == "lloyd_max":
             return True
@@ -115,6 +120,8 @@ class Scaled:
                 scaling=self.scaling,
                 scaling_match=self.scaling_match,
                 compressor=self.compressor,
+                vq_length=self.vq_length,
+                vq_format=self.vq_format,
                 args=self.args,
             ),
             self.scale_format,
@@ -180,6 +187,8 @@ def _scaled_element_format(
     scaling: Q.Scaling,
     scaling_match: Literal["search", "moments"],
     compressor: Q.Compressor | tuple[Q.Compressor, Q.Compressor] | None,
+    vq_length: int | None,
+    vq_format: Q.ScalarFormat | None,
     args: dict[str, Any],
 ) -> Q.TensorFormat:
     """Fit a scaled element format to the given tensor."""
@@ -195,10 +204,12 @@ def _scaled_element_format(
 
     if compressor is not None:
         # Find a grid resolution to hit the target `element_bits`
-        if element_family != "int":
+
+        if element_family != "int" or vq_length is not None:
             raise ValueError(
-                'fit.Scaled with compression only supports element_family="int"'
+                'fit.Scaled with compression only supports element_family="int", vq_length=None'
             )
+
         # Note: element_range=(-1, 1) is safe for absmax|signmax, since
         # _find_compressed_grid_quantiser returned format has range (-amax, amax)
         tensor, _ = normalised((-1, 1))
@@ -208,6 +219,20 @@ def _scaled_element_format(
             compressor,
             args,
             target_bits=element_bits,
+        )
+
+    if element_family == "lloyd_max" and vq_length:
+        # Train a VQ Lloyd-Max quantiser on the normalised tensor
+        args = args.copy()
+        args.setdefault("threshold", 1e-3)
+        # Note: report the range consistently with training, not based on the actual absmax
+        tensor, _ = normalised((-1, 1))
+        return Q.vlut_lloyd_max(
+            tensor=tensor.view(-1, vq_length),
+            bits=element_bits,
+            element_type=vq_format,
+            range=(-1, 1),
+            **args,
         )
 
     if element_family == "lloyd_max":

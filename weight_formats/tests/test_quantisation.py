@@ -1,6 +1,7 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
 import dataclasses
+import itertools as it
 import json
 from math import log2
 from typing import Any
@@ -139,6 +140,23 @@ def test_lut_format() -> None:
     )
 
 
+def test_vlut_format() -> None:
+    torch.manual_seed(100)
+    x = torch.randn(2**20)
+    fmt = Q.crd_normal(3)
+
+    vfmt = Q.VectorLUTFormat.create(
+        tuple(it.product(fmt.values, fmt.values)), Q.BFLOAT16, "LM2"
+    )
+    assert vfmt.index_bits == 3
+    assert vfmt.dim == 2
+    expected_bits = 3 * x.nelement() + (2 ** (3 * 2)) * 2 * 16
+    assert vfmt.count_bits_tensor(x) == expected_bits
+    torch.testing.assert_close(
+        Q.qrmse_norm(vfmt, x), Q.qrmse_norm(fmt, x), rtol=1e-3, atol=0
+    )
+
+
 def test_scalar_formats() -> None:
     for fmt in [
         # Torch
@@ -199,6 +217,15 @@ def test_lloyd_max_crd() -> None:
         rmse_crd = torch.stack([Q.qrmse_norm(fmt, X) for fmt in crds])
         assert rmse_crd.argmin() == i
         assert (rmse_crd.min() - rmse_lm).abs() < 0.1
+
+
+def test_vlut_lloyd_max() -> None:
+    torch.manual_seed(100)
+    x = torch.distributions.StudentT(7).sample((2**16,))
+    sfmt = Q.lut_lloyd_max(x, 2, 10**-4)
+    for init in ["random", "kmeans++"]:
+        vfmt = Q.vlut_lloyd_max(x.view(-1, 2), 2, 10**-3, Q.BFLOAT16, init=init)
+        assert Q.qrmse_norm(vfmt, x).item() < Q.qrmse_norm(sfmt, x).item() - 0.01, init
 
 
 # Wrappers
