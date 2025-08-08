@@ -20,9 +20,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, TypeAlias
 
 import datasets
-import oe_eval.models.eleuther_huggingface
-import oe_eval.run_eval
-import oe_eval.tasks.oe_eval_tasks
 import safetensors.torch
 import torch
 import torch.multiprocessing as multiprocessing
@@ -169,6 +166,10 @@ class Run:
 
 
 def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
+    import oe_eval.models.eleuther_huggingface
+    import oe_eval.run_eval
+    import oe_eval.tasks.oe_eval_tasks
+
     t0 = time.time()
     oe_task = oe_eval.tasks.oe_eval_tasks.TASK_REGISTRY[task.name](task_name=task.name)
     oe_task.download()
