@@ -257,7 +257,7 @@ def convert(
                     if child.weight in shared_weights:
                         # Copy the module, then share the parameters individually
                         src = shared_weights[child.weight]
-                        weight = copy.deepcopy(weight)
+                        weight = copy.deepcopy(src)
                         for k in src._parameters:
                             setattr(weight, k, getattr(src, k))
                     else:
