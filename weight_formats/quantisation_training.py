@@ -196,8 +196,17 @@ class Weight(nn.Module):
         return ", ".join(map(str, self.shape))
 
 
+class UnquantisedWeight(nn.Module):
+    def __init__(self, weight: Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight)
+
+    def forward(self) -> Tensor:
+        return self.weight
+
+
 class Linear(nn.Module):
-    def __init__(self, weight: Weight, bias: nn.Parameter | None):
+    def __init__(self, weight: Weight | UnquantisedWeight, bias: nn.Parameter | None):
         super().__init__()
         self.weight = weight
         self.bias = bias
@@ -207,7 +216,7 @@ class Linear(nn.Module):
 
 
 class Embedding(nn.Module):
-    def __init__(self, weight: Weight, padding_idx: int | None):
+    def __init__(self, weight: Weight | UnquantisedWeight, padding_idx: int | None):
         super().__init__()
         self.weight = weight
         self.padding_idx = padding_idx
@@ -228,57 +237,74 @@ def convert(
     """Recursively convert `module` to a trainable quantised model."""
 
     shared_weights = {}
-    with torch.no_grad():
-        for parent_name, parent in module.named_modules():
-            for name, child in list(parent.named_children()):
-                replace_cls = None
-                replace_args = {}
-                if isinstance(child, nn.Linear):
-                    if type(child) != nn.Linear:
-                        raise ValueError(f"Cannot convert {type(child)}")
-                    replace_cls = Linear
-                    replace_args = dict(
-                        bias=(
-                            None
-                            if child.bias is None
-                            else nn.Parameter(child.bias.clone())
-                        )
+    visited_modules = set([])
+
+    def _visit(parent: nn.Module, prefix: tuple[str, ...]) -> None:
+        if parent in visited_modules:
+            return
+        visited_modules.add(parent)
+
+        for name, child in list(parent.named_children()):
+            # Depth-first order, to match model.named_parameters()
+            # This is important when sharing parameters, to use the correct name
+            _visit(child, prefix + (name,))
+
+            # Determine if we want to make a substitution
+            replace_cls, replace_args = None, {}
+            if isinstance(child, nn.Linear):
+                if type(child) != nn.Linear:
+                    raise ValueError(f"Cannot convert {type(child)}")
+                replace_cls = Linear
+                replace_args = dict(
+                    bias=(
+                        None if child.bias is None else nn.Parameter(child.bias.clone())
                     )
+                )
+            if isinstance(child, nn.Embedding):
+                if type(child) != nn.Embedding or not (child.max_norm is None):
+                    raise ValueError(
+                        f"Cannot convert {type(child)}(max_norm={child.max_norm})"
+                    )
+                replace_cls = Embedding
+                replace_args = dict(padding_idx=child.padding_idx)
 
-                if isinstance(child, nn.Embedding):
-                    if type(child) != nn.Embedding or not (child.max_norm is None):
-                        raise ValueError(
-                            f"Cannot convert {type(child)}(max_norm={child.max_norm})"
+            # Substitute `child` to use a `Weight` module
+            if replace_cls:
+                if child.weight in shared_weights:
+                    # Copy the module, then share the parameters individually
+                    src = shared_weights[child.weight]
+                    weight = copy.deepcopy(src)
+                    for k in src._parameters:
+                        setattr(weight, k, getattr(src, k))
+                else:
+                    # Find the requested format
+                    pname = ".".join((*prefix, name, "weight"))
+                    pspec = fmt_spec[pname] if isinstance(fmt_spec, dict) else fmt_spec
+                    fmt = (
+                        pspec.fit(
+                            child.weight,
+                            error_weight[name] if error_weight else None,
                         )
-                    replace_cls = Embedding
-                    replace_args = dict(padding_idx=child.padding_idx)
-
-                if replace_cls:
-                    if child.weight in shared_weights:
-                        # Copy the module, then share the parameters individually
-                        src = shared_weights[child.weight]
-                        weight = copy.deepcopy(src)
-                        for k in src._parameters:
-                            setattr(weight, k, getattr(src, k))
-                    else:
-                        pname = ".".join(
-                            filter(None, parent_name.split(".") + [name, "weight"])
-                        )
-                        pspec = (
-                            fmt_spec[pname] if isinstance(fmt_spec, dict) else fmt_spec
-                        )
-                        fmt = (
-                            pspec.fit(
-                                child.weight,
-                                error_weight[name] if error_weight else None,
+                        if isinstance(pspec, F.Scaled)
+                        else pspec
+                    )
+                    if isinstance(fmt, Q.TorchFormat):
+                        if fmt.torch_dtype != child.weight.dtype:
+                            raise ValueError(
+                                f"Cannot treat parameter {pname} of dtype {child.weight.dtype}"
+                                " as unquanised dtype {fmt.torch_dtype}"
                             )
-                            if isinstance(pspec, F.Scaled)
-                            else pspec
+                        weight = shared_weights[child.weight] = UnquantisedWeight(
+                            child.weight
                         )
+                    else:
+                        # Construct quantised weight
                         weight = shared_weights[child.weight] = Weight(
                             child.weight, fmt, scaling_mode, clip_gradient
                         )
-                    parent.add_module(name, replace_cls(weight, **replace_args))
+                parent.add_module(name, replace_cls(weight, **replace_args))
+
+    _visit(module, ())
 
 
 def get_named_parameters(
