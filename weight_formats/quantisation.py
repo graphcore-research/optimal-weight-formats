@@ -2,11 +2,15 @@
 
 """Utilities for "fake quantisation"."""
 
+import abc
 import builtins
 import bz2
+import dataclasses
+import inspect
 import itertools as it
 import math
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Tuple, TypeAlias, Union, cast
 
@@ -55,9 +59,12 @@ def snr(x: Tensor, qx: Tensor) -> Tensor:
 # Tensor formats
 
 
-class TensorFormat:
+class TensorFormat(metaclass=abc.ABCMeta):
     """Quantisation formats for tensors."""
 
+    # _type: str = "..."  # to support save/load
+
+    @abc.abstractmethod
     def quantise(self, tensor: Tensor) -> Tensor:
         raise NotImplementedError
 
@@ -66,6 +73,38 @@ class TensorFormat:
 
     def count_bits_tensor(self, tensor: Tensor) -> float:
         return self.count_bits(tensor.shape)
+
+    @classmethod
+    def save(cls, obj: "TensorFormat") -> dict[str, Any]:
+        d = {f.name: getattr(obj, f.name) for f in dataclasses.fields(obj)}
+        for k, v in list(d.items()):
+            if isinstance(v, TensorFormat):
+                d[k] = cls.save(v)
+            elif isinstance(v, Tensor):
+                d[k] = dict(
+                    _type="tensor",
+                    data=v.flatten().tolist(),
+                    shape=v.shape,
+                    dtype=str(v.dtype).replace("torch.", ""),
+                )
+        return d
+
+    @classmethod
+    def load(cls, d: dict[str, Any]) -> "TensorFormat":
+        d = d.copy()
+        for k, v in list(d.items()):
+            if isinstance(v, dict) and v.get("_type") == "tensor":
+                d[k] = torch.tensor(
+                    v["data"],
+                    dtype=getattr(torch, v["dtype"]),
+                    device="cpu",
+                ).view(v["shape"])
+            elif isinstance(v, dict) and "_type" in v:
+                d[k] = cls.load(v)
+            elif isinstance(v, list):
+                d[k] = tuple(v)
+        subcls = TENSOR_TYPE_KEY_TO_TYPE[d.pop("_type")]
+        return subcls(**d)
 
 
 # Scalar formats
@@ -1286,6 +1325,8 @@ class CompressedLUTFormat(CompressedTensorFormat):
     model_logp: Tensor
     compressor: Compressor
 
+    _type: str = "compressed_lut"
+
     def __post_init__(self):
         assert self.model_logp.shape == (len(self.lut.values),)
         assert self.model_logp.exp().sum().sub(1).abs().item() < 1e-4
@@ -1395,3 +1436,17 @@ class CompressedLUTFormat(CompressedTensorFormat):
         return cls.train(
             lut_grid(resolution, data.abs().amax().item()), data=data, **args
         )
+
+
+# Type index
+
+
+def _get_tensor_type_key_to_type() -> dict[str, type[TensorFormat]]:
+    results = {}
+    for _, type_ in inspect.getmembers(sys.modules[__name__], inspect.isclass):
+        if issubclass(type_, TensorFormat) and not inspect.isabstract(type_):
+            results[type_._type] = type_
+    return results
+
+
+TENSOR_TYPE_KEY_TO_TYPE = _get_tensor_type_key_to_type()

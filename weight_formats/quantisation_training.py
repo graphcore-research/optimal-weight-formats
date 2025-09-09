@@ -3,8 +3,10 @@
 """Core utilities for quantisation-aware training."""
 
 import copy
+import dataclasses
+import json
 import math
-from typing import Literal, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import torch
 from torch import Tensor, nn
@@ -288,12 +290,7 @@ def convert(
                         if isinstance(pspec, F.Scaled)
                         else pspec
                     )
-                    if isinstance(fmt, Q.TorchFormat):
-                        if fmt.torch_dtype != child.weight.dtype:
-                            raise ValueError(
-                                f"Cannot treat parameter {pname} of dtype {child.weight.dtype}"
-                                " as unquanised dtype {fmt.torch_dtype}"
-                            )
+                    if isinstance(fmt, Q.TorchFormat) and fmt.dtype == "bfloat16":
                         weight = shared_weights[child.weight] = UnquantisedWeight(
                             child.weight
                         )
@@ -305,6 +302,9 @@ def convert(
                 parent.add_module(name, replace_cls(weight, **replace_args))
 
     _visit(module, ())
+    module._quantisation_args = dict(
+        scaling_mode=scaling_mode, clip_gradient=clip_gradient
+    )
 
 
 def get_named_parameters(
@@ -373,3 +373,40 @@ def count_parameters(module: nn.Module, include_other: bool = True) -> int:
                 total += p.nelement()
                 visited.add(p)
     return total
+
+
+def save(module: nn.Module) -> dict[str, Tensor]:
+    """Add quantisation metadata into `module.state_dict()`.
+
+    Usage:
+
+        module = load_unquantised()
+        T.convert(module, ...)
+        state = T.save(module)
+
+        # save/reload state using torch.save / safetensors / etc
+
+        module = load_unquantised()
+        T.load_convert(module, state)
+    """
+
+    state_dict = module.state_dict()
+    meta = dict(fmt={}, **module._quantisation_args.copy())
+    for k, m in module.named_modules():
+        if isinstance(m, Weight):
+            meta["fmt"][k] = Q.TensorFormat.save(m.fmt)
+        if isinstance(m, UnquantisedWeight):
+            meta["fmt"][k] = Q.TensorFormat.save(Q.BFLOAT16)
+    state_dict["_quantisation_meta"] = torch.frombuffer(
+        bytearray(json.dumps(meta), encoding="utf8"), dtype=torch.int8
+    )
+    return state_dict
+
+
+def load_convert(module: nn.Module, state: dict[str, Tensor]) -> None:
+    """Load and convert a module to a quantised version."""
+    state = state.copy()
+    meta = json.loads(state.pop("_quantisation_meta").numpy().tobytes())
+    fmt = {k: Q.TensorFormat.load(s) for k, s in meta.pop("fmt").items()}
+    convert(module, fmt_spec=fmt, **meta, error_weight=None)
+    module.load_state_dict(state)

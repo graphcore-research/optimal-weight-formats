@@ -180,3 +180,12 @@ def test_convert_and_train() -> None:
         opt.step()
         losses.append(loss.item())
     assert losses[-1] < losses[0] * 0.75
+
+    # Check we can reload using T.save -> T.load_convert
+    reloaded = copy.deepcopy(reference)
+    assert not torch.allclose(reloaded(input), model(input))
+    assert T.count_bits(reloaded, torch.bfloat16) != T.count_bits(model, torch.bfloat16)
+
+    T.load_convert(reloaded, T.save(model))
+    torch.testing.assert_close(reloaded(input), model(input))
+    assert T.count_bits(reloaded, torch.bfloat16) == T.count_bits(model, torch.bfloat16)

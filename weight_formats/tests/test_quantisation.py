@@ -13,10 +13,6 @@ from torch import tensor
 from .. import quantisation as Q
 
 
-def _json_roundtrip(s: Any) -> Any:
-    return type(s)(**json.loads(json.dumps(dataclasses.asdict(s))))
-
-
 # Utilities
 
 
@@ -198,7 +194,10 @@ def test_scalar_formats() -> None:
             ]
             torch.testing.assert_close(qx, closest)
 
-        assert _json_roundtrip(fmt) == fmt
+        fmt_reloaded = Q.TensorFormat.load(
+            json.loads(json.dumps(Q.TensorFormat.save(fmt)))
+        )
+        assert fmt_reloaded == fmt
 
 
 def test_lloyd_max_crd() -> None:
