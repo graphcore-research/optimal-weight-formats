@@ -390,9 +390,12 @@ def save(module: nn.Module) -> dict[str, Tensor]:
         T.load_convert(module, state)
     """
 
-    state_dict = module.state_dict()
+    state_dict = {
+        k.replace("._orig_mod", ""): v for k, v in module.state_dict().items()
+    }
     meta = dict(fmt={}, **module._quantisation_args.copy())
     for k, m in module.named_modules():
+        k = k.replace("._orig_mod", "")
         if isinstance(m, Weight):
             meta["fmt"][k] = Q.TensorFormat.save(m.fmt)
         if isinstance(m, UnquantisedWeight):
