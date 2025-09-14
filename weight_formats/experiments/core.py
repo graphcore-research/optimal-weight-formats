@@ -340,7 +340,7 @@ class _LocalDB:
     def __init__(self, path: Path, key: tuple[str, ...]):
         if not path.parent.exists():
             path.parent.mkdir()
-        self._shelf = shelve.open(path).__enter__()
+        self._shelf = shelve.open(str(path)).__enter__()
         self.key = key
 
     def _name(self, key: dict[str, Any]) -> None:
