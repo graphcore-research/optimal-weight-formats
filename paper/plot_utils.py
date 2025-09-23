@@ -265,7 +265,7 @@ def fmt_latex_booktabs(df: pd.DataFrame, cols: dict[str, str]) -> str:
             return str(v)
 
     s = r"\begin{tabular}" + "{" + "l" * len(cols) + "}" + r" \toprule"
-    s += "\n  " + " & ".join(cols.values()) + r" \\\midrule"
+    s += "\n  " + " & ".join(map(fmt_value, cols.values())) + r" \\\midrule"
     for _, row in df.iterrows():
         s += "\n  " + " & ".join(fmt_value(row[col]) for col in cols) + r" \\"
     s += "\n" + r"\bottomrule"
