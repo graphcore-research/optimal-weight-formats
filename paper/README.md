@@ -23,6 +23,9 @@ python paper/scripts/noise_sensitivity.py
 # 4. Main sweep (long, highly recommend breaking into stages)
 python paper/scripts/main_sweep.py
 python paper/scripts/main_sweep_code.py
+
+# 5. QAT sweep (long, requires multiple GPUs)
+python paper/scripts/qat_sweep.py
 ```
 
 After running these, the results are stored in a local database (in `optimal-weight-formats/.results/`) and are accessible via `E.runs()` etc. The paper figures from `paper/*.ipynb` can be used to retrieve and plot them.
