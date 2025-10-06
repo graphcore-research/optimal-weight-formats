@@ -1,5 +1,6 @@
 # Copyright (c) 2025 Graphcore Ltd. All rights reserved.
 
+import pytest
 import torch
 from torch import nn
 
@@ -7,7 +8,8 @@ from .. import qat
 from ..core import AttrDict
 
 
-def test_compute_kl_loss() -> None:
+@pytest.mark.parametrize("pass_mask", [False, True])
+def test_compute_kl_loss(pass_mask: bool) -> None:
     torch.manual_seed(100)
 
     reference_logits = torch.randn((3, 5, 16))
@@ -20,13 +22,25 @@ def test_compute_kl_loss() -> None:
     model_logits_ref = model_logits.detach().clone().requires_grad_()
     model_logits_ref.retain_grad()
 
-    mask = torch.rand(reference_logits.shape[:-1]) < 0.75
+    attention_mask = torch.rand(reference_logits.shape[:-1]) < 0.75
 
-    loss = qat._compute_kl_loss(
-        lambda attention_mask, use_cache: AttrDict(logits=model_logits),
-        lambda attention_mask, use_cache: AttrDict(logits=reference_logits),
-        AttrDict(attention_mask=mask),
-    )
+    if pass_mask:
+        mask = torch.rand(reference_logits.shape[:-1]) < 0.5
+        full_mask = attention_mask & mask
+
+        loss = qat._compute_kl_loss(
+            lambda attention_mask, use_cache: AttrDict(logits=model_logits),
+            lambda attention_mask, use_cache: AttrDict(logits=reference_logits),
+            AttrDict(attention_mask=attention_mask),
+            mask=mask,
+        )
+    else:
+        full_mask = attention_mask
+        loss = qat._compute_kl_loss(
+            lambda attention_mask, use_cache: AttrDict(logits=model_logits),
+            lambda attention_mask, use_cache: AttrDict(logits=reference_logits),
+            AttrDict(attention_mask=attention_mask),
+        )
     loss.backward()
 
     loss_ref = (
@@ -36,7 +50,7 @@ def test_compute_kl_loss() -> None:
             log_target=True,
             reduction="none",
         )
-        .mul(mask.unsqueeze(-1))
+        .mul(full_mask.unsqueeze(-1))
         .sum()
     )
     loss_ref.backward()

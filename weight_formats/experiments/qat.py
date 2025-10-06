@@ -225,14 +225,23 @@ class XEnt_Destructive(torch.autograd.Function):
 
 
 def _compute_kl_loss(
-    model: nn.Module, reference_model: nn.Module, batch: dict[str, Tensor]
+    model: nn.Module,
+    reference_model: nn.Module,
+    batch: dict[str, Tensor],
+    mask: Tensor | None = None,
 ) -> Tensor:
     """Computes the KL divergence between the output of two models, with care for memory."""
+    if mask is None:
+        mask = batch["attention_mask"]
+    else:
+        assert mask.shape == batch["attention_mask"].shape
+        mask = mask & batch["attention_mask"]
+
     with torch.no_grad():
         reference_logp = torch.log_softmax(
             reference_model(**batch, use_cache=False).logits, -1
         )
-        reference_p = reference_logp.exp().mul_(batch["attention_mask"].unsqueeze(-1))
+        reference_p = reference_logp.exp().mul_(mask.unsqueeze(-1))
         # Calculate reference entropy here, so we can free up `reference_logp`
         reference_ent = torch.dot(reference_p.flatten(), reference_logp.flatten()).neg()
         del reference_logp
@@ -240,7 +249,7 @@ def _compute_kl_loss(
     xent = XEnt_Destructive.apply(
         model(**batch, use_cache=False).logits,
         reference_p,
-        batch["attention_mask"].unsqueeze(-1),
+        mask.unsqueeze(-1),
     )
     return xent - reference_ent
 
