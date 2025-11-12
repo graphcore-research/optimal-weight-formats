@@ -200,6 +200,14 @@ def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
 # Quantisation-Aware Training
 
 
+def _safe_torch_dot(input: Tensor, other: Tensor, chunk_size=2**31 - 1) -> Tensor:
+    """Computes the dot product of two 1D tensors in chunks to avoid size limits."""
+    out = torch.tensor(0.0, device=input.device, dtype=input.dtype)
+    for i in range(0, len(input), chunk_size):
+        out += torch.dot(input[i : i + chunk_size], other[i : i + chunk_size])
+    return out
+
+
 class XEnt_Destructive(torch.autograd.Function):
     """A somewhat dangerous in-place Cross-Entropy, optimised for memory-efficiency.
 
@@ -212,7 +220,7 @@ class XEnt_Destructive(torch.autograd.Function):
         input_logp = input_logits.sub_(torch.logsumexp(input_logits, -1, keepdim=True))
         del input_logits
         ctx.save_for_backward(input_logp, target_p, mask)
-        return torch.dot(target_p.flatten(), input_logp.flatten()).neg()
+        return _safe_torch_dot(target_p.flatten(), input_logp.flatten()).neg()
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -243,7 +251,9 @@ def _compute_kl_loss(
         )
         reference_p = reference_logp.exp().mul_(mask.unsqueeze(-1))
         # Calculate reference entropy here, so we can free up `reference_logp`
-        reference_ent = torch.dot(reference_p.flatten(), reference_logp.flatten()).neg()
+        reference_ent = _safe_torch_dot(
+            reference_p.flatten(), reference_logp.flatten()
+        ).neg()
         del reference_logp
 
     xent = XEnt_Destructive.apply(
