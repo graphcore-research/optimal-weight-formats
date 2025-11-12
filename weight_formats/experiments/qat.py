@@ -200,7 +200,7 @@ def evaluate(model: transformers.PreTrainedModel, task: Task) -> dict[str, Any]:
 # Quantisation-Aware Training
 
 
-def _safe_torch_dot(input: Tensor, other: Tensor, chunk_size=2**32 - 1) -> Tensor:
+def _safe_torch_dot(input: Tensor, other: Tensor, chunk_size=2**31 - 1) -> Tensor:
     """Computes the dot product of two 1D tensors in chunks to avoid size limits."""
     out = torch.tensor(0.0, device=input.device, dtype=input.dtype)
     for i in range(0, len(input), chunk_size):
