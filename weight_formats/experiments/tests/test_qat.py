@@ -8,6 +8,14 @@ from .. import qat
 from ..core import AttrDict
 
 
+def test_safe_torch_dot() -> None:
+    x1 = torch.randn(100)
+    x2 = torch.randn(100)
+    torch.testing.assert_close(
+        qat._safe_torch_dot(x1, x2, chunk_size=16), torch.dot(x1, x2)
+    )
+
+
 @pytest.mark.parametrize("pass_mask", [False, True])
 def test_compute_kl_loss(pass_mask: bool) -> None:
     torch.manual_seed(100)
