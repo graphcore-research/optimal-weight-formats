@@ -110,6 +110,8 @@ class Sweep:
     batch_size: int = 1
     model: list[str] = core.FIELD_MODELS
     device: torch.device = core.FIELD_DEVICE
+    dtype: torch.dtype = torch.bfloat16
+    attn_implementation: str | None = None
     type: str = "fisher"
 
     def run(self, out: Path) -> None:
@@ -118,7 +120,10 @@ class Sweep:
         ):
             with core.Experiment(config) as experiment:
                 model = transformers.AutoModelForCausalLM.from_pretrained(
-                    config["model"], torch_dtype=torch.bfloat16, device_map=self.device
+                    config["model"],
+                    torch_dtype=config["dtype"],
+                    device_map=self.device,
+                    attn_implementation=self.attn_implementation,
                 )
                 data = token_prediction.Dataset.load(
                     model,

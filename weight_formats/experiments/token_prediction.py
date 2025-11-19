@@ -413,6 +413,7 @@ class Run:
     line_limit: int | None = None
     dataset: Literal["wikitext", "github-code"] = "wikitext"
     device: torch.device = core.FIELD_DEVICE
+    dtype: torch.dtype = torch.bfloat16
     type: str = "token_prediction"
 
 
@@ -438,7 +439,7 @@ class _Runner:
             self.model = core.RequantisableModel.load(
                 run.model,
                 device=run.device,
-                dtype=torch.bfloat16,
+                dtype=run.dtype,
             )
             self.data = Dataset.load(
                 self.model.model,
