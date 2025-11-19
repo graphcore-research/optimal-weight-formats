@@ -82,6 +82,8 @@ def diag_fisher(
                 .unsqueeze(1)
                 .broadcast_to(targets.shape)
             )
+            del logits, targets
+            torch.cuda.empty_cache()
         results = {}
         for module in model.modules():
             if isinstance(module, S.Wrapper):
