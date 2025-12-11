@@ -235,7 +235,7 @@ def convert(
     scaling_mode: ScalingMode,
     clip_gradient: bool,
     error_weight: dict[str, Tensor] | None,
-    perturb_only: bool = False,
+    mode: Literal["qat", "one-shot"] = "qat",
 ) -> None:
     """Recursively convert `module` to a trainable quantised model."""
 
@@ -299,7 +299,7 @@ def convert(
                         # Construct quantised weight
                         weight = Weight(child.weight, fmt, scaling_mode, clip_gradient)
 
-                        if perturb_only:
+                        if mode == "one-shot":
                             with torch.no_grad():
                                 child.weight.copy_(weight())
                                 weight = UnquantisedWeight(child.weight)

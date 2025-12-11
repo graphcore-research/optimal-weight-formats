@@ -194,41 +194,41 @@ def test_convert_and_train() -> None:
 def test_convert_perturb_only() -> None:
     torch.manual_seed(100)
     reference = nn.Sequential(nn.Linear(64, 512, bias=False))
-    model = copy.deepcopy(reference)
-    model_po = copy.deepcopy(reference)
+    model_qat = copy.deepcopy(reference)
+    model_os = copy.deepcopy(reference)
 
     T.convert(
-        model,
+        model_qat,
         F.Scaled(3, "int", Q.BFLOAT16, (1, 8), "absmax"),
         "dynamic",
         clip_gradient=False,
         error_weight=None,
     )
     T.convert(
-        model_po,
+        model_os,
         F.Scaled(3, "int", Q.BFLOAT16, (1, 8), "absmax"),
         "dynamic",
         clip_gradient=False,
         error_weight=None,
-        perturb_only=True,
+        mode="one-shot",
     )
     input = torch.randn(2048, 64)
 
     # Check forward matches for perturb_only True/False
-    torch.testing.assert_close(model_po(input), model(input))
+    torch.testing.assert_close(model_os(input), model_qat(input))
 
     # Copy the values to original model, check badward matches
     with torch.no_grad():
-        reference[0].weight.copy_(model_po[0].weight.weight.data)
+        reference[0].weight.copy_(model_os[0].weight.weight.data)
 
     opt1 = torch.optim.Adam(reference.parameters(), lr=1e-4)
-    opt2 = torch.optim.Adam(model_po.parameters(), lr=1e-4)
+    opt2 = torch.optim.Adam(model_os.parameters(), lr=1e-4)
 
     for _ in range(5):
-        for m, opt in zip([reference, model_po], [opt1, opt2]):
+        for m, opt in zip([reference, model_os], [opt1, opt2]):
             opt.zero_grad()
             loss = m(input).pow(2).sum()
             loss.backward()
             opt.step()
 
-    torch.testing.assert_close(reference[0].weight, model_po[0].weight.weight)
+    torch.testing.assert_close(reference[0].weight, model_os[0].weight.weight)
