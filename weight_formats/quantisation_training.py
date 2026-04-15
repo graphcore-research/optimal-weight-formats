@@ -208,12 +208,21 @@ class UnquantisedWeight(nn.Module):
 
 
 class Linear(nn.Module):
-    def __init__(self, weight: Weight | UnquantisedWeight, bias: nn.Parameter | None):
+    def __init__(
+        self,
+        weight: Weight | UnquantisedWeight,
+        bias: nn.Parameter | None,
+        activation_fmt: Q.TensorFormat | None,
+    ):
         super().__init__()
         self.weight = weight
         self.bias = bias
+        self.activation_fmt = activation_fmt
 
     def forward(self, input: Tensor) -> Tensor:
+        if self.activation_fmt is not None:
+            q = self.activation_fmt.quantise(input.flatten(end_dim=-2)).view_as(input)
+            input = input + (q - input).detach()  # STE
         return nn.functional.linear(input, self.weight(), self.bias)
 
 
@@ -235,6 +244,7 @@ def convert(
     scaling_mode: ScalingMode,
     clip_gradient: bool,
     error_weight: dict[str, Tensor] | None,
+    activation_fmt: Q.TensorFormat | None,
     mode: Literal["qat", "one-shot"] = "qat",
 ) -> None:
     """Recursively convert `module` to a trainable quantised model."""
@@ -259,9 +269,10 @@ def convert(
                     raise ValueError(f"Cannot convert {type(child)}")
                 replace_cls = Linear
                 replace_args = dict(
+                    activation_fmt=activation_fmt,
                     bias=(
                         None if child.bias is None else nn.Parameter(child.bias.clone())
-                    )
+                    ),
                 )
             if isinstance(child, nn.Embedding):
                 if type(child) != nn.Embedding or not (child.max_norm is None):
@@ -310,7 +321,9 @@ def convert(
 
     _visit(module, ())
     module._quantisation_args = dict(
-        scaling_mode=scaling_mode, clip_gradient=clip_gradient
+        activation_fmt=activation_fmt,
+        scaling_mode=scaling_mode,
+        clip_gradient=clip_gradient,
     )
 
 
@@ -400,7 +413,10 @@ def save(module: nn.Module) -> dict[str, Tensor]:
     state_dict = {
         k.replace("._orig_mod", ""): v for k, v in module.state_dict().items()
     }
-    meta = dict(fmt={}, **module._quantisation_args.copy())
+    meta = module._quantisation_args.copy()
+    if meta["activation_fmt"] is not None:
+        meta["activation_fmt"] = Q.TensorFormat.save(meta["activation_fmt"])
+    meta["fmt"] = {}
     for k, m in module.named_modules():
         k = k.replace("._orig_mod", "")
         if isinstance(m, Weight):
@@ -417,6 +433,10 @@ def load_convert(module: nn.Module, state: dict[str, Tensor]) -> None:
     """Load and convert a module to a quantised version."""
     state = state.copy()
     meta = json.loads(state.pop("_quantisation_meta").numpy().tobytes())
+    if meta.get("activation_fmt") is not None:
+        meta["activation_fmt"] = Q.TensorFormat.load(meta["activation_fmt"])
+    else:
+        meta["activation_fmt"] = None
     fmt = {k: Q.TensorFormat.load(s) for k, s in meta.pop("fmt").items()}
     convert(module, fmt_spec=fmt, **meta, error_weight=None)
     module.load_state_dict(state)

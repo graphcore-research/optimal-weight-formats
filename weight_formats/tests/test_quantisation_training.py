@@ -10,6 +10,14 @@ from .. import quantisation as Q
 from .. import quantisation_training as T
 
 
+CHANNEL_ABSMAX_INT8 = Q.LinearScalingFormat(
+    Q.IntFormat(8),
+    scale_format=Q.BFLOAT16,
+    block_shape=(1, None),
+    scaling="absmax",
+)
+
+
 def test_quantise_ste() -> None:
     x = tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, -0.2, -0.4, 1.2, 1.4]).requires_grad_()
     ex = tensor([0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0])
@@ -126,8 +134,40 @@ def test_convert_embedding() -> None:
         "dynamic",
         clip_gradient=False,
         error_weight=None,
+        activation_fmt=None,
     )
     assert model(input).shape == (5, 16)
+
+
+def test_convert_linear_with_activation_quantisation() -> None:
+    torch.manual_seed(100)
+    reference = nn.Sequential(nn.Linear(64, 32, bias=True))
+    model = copy.deepcopy(reference)
+    input = torch.randn(8, 16, 64).requires_grad_()
+
+    T.convert(
+        model,
+        Q.BFLOAT16,
+        "dynamic",
+        clip_gradient=False,
+        activation_fmt=CHANNEL_ABSMAX_INT8,
+        error_weight=None,
+    )
+
+    output = model(input)
+    reference_input = (
+        CHANNEL_ABSMAX_INT8.quantise(input.view(-1, 64))
+        .view_as(input)
+        .detach()
+        .clone()
+        .requires_grad_()
+    )
+    reference_output = reference(reference_input)
+    output.square().mean().backward()
+    reference_output.square().mean().backward()
+
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(input.grad, reference_input.grad)
 
 
 def test_convert_and_train() -> None:
@@ -157,6 +197,7 @@ def test_convert_and_train() -> None:
         scaling_mode="parameter",
         clip_gradient=True,
         error_weight=None,
+        activation_fmt=CHANNEL_ABSMAX_INT8,
     )
 
     bpp = T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
@@ -203,6 +244,7 @@ def test_convert_perturb_only() -> None:
         "dynamic",
         clip_gradient=False,
         error_weight=None,
+        activation_fmt=None,
     )
     T.convert(
         model_os,
@@ -211,6 +253,7 @@ def test_convert_perturb_only() -> None:
         clip_gradient=False,
         error_weight=None,
         mode="one-shot",
+        activation_fmt=None,
     )
     input = torch.randn(2048, 64)
 
