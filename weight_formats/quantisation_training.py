@@ -3,12 +3,12 @@
 """Core utilities for quantisation-aware training."""
 
 import copy
-import dataclasses
 import json
 import math
-from typing import Any, Literal, TypeAlias
+from typing import Literal, TypeAlias
 
 import torch
+import tqdm
 from torch import Tensor, nn
 
 from . import fit as F
@@ -51,6 +51,32 @@ class Quantise_STE(torch.autograd.Function):
             gcentroids = gcentroids.to(centroids.dtype)
 
         return (gx, gcentroids, None)
+
+
+class Quantise_Vector_STE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, centroids: Tensor) -> Tensor:
+        idx = Q._nearest_neighbour(x, centroids)
+        ctx.x_requires_grad = x.requires_grad
+        ctx.centroids_requires_grad = centroids.requires_grad
+        if centroids.requires_grad:
+            ctx.save_for_backward(idx, centroids)
+        return centroids[idx].to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, gy: Tensor) -> tuple[Tensor, Tensor]:
+        gx = gy if ctx.x_requires_grad else None
+
+        if not ctx.centroids_requires_grad:
+            gcentroids = None
+        else:
+            idx, centroids = ctx.saved_tensors
+            gcentroids = torch.zeros_like(centroids, dtype=torch.float32)
+            gcentroids.index_add_(
+                0, idx.flatten(), gy.reshape(-1, centroids.shape[1]).float()
+            )
+            gcentroids = gcentroids.to(centroids.dtype)
+        return (gx, gcentroids)
 
 
 ScalingMode: TypeAlias = Literal["parameter", "dynamic"]
@@ -112,6 +138,7 @@ class Weight(nn.Module):
                 dtype=self.master.dtype,
             )
         )
+        assert self.centroids.ndim == 1, "Weight() only supports 1D centroids"
         self._blocked_shape = Q.blocked_shape(self.master, scaling_fmt.block_shape)
         if scaling_mode == "parameter":
             scale = Q.blocked_scale(
@@ -198,6 +225,91 @@ class Weight(nn.Module):
         return ", ".join(map(str, self.shape))
 
 
+class Sign3D8Weight(nn.Module):
+    @staticmethod
+    def is_supported(fmt: Q.TensorFormat) -> bool:
+        return isinstance(fmt, Q.LinearScalingFormat) and isinstance(
+            fmt.element_format, Q.Sign3D8Format
+        )
+
+    def __init__(
+        self,
+        weight: Tensor,
+        fmt: Q.LinearScalingFormat,
+        scaling_mode: ScalingMode,
+    ):
+        super().__init__()
+        self.fmt = fmt
+        self.scaling_mode = scaling_mode
+        self.master = nn.Parameter(weight)
+        self._blocked_shape = Q.blocked_shape(self.master, fmt.block_shape)
+        # Centroids are untrainable as we don't support requantisation using element_type
+        self.centroids = nn.Parameter(
+            fmt.element_format.lut.element_type.quantise(
+                torch.tensor(
+                    fmt.element_format.lut.values,
+                    device=self.master.device,
+                    dtype=torch.float32,
+                )
+            ),
+            requires_grad=False,
+        )
+        self._element_value_bits = fmt.element_format.lut.element_type.bits
+        self._scale_format = fmt.scale_format
+        if scaling_mode == "parameter":
+            scale = Q.blocked_scale(
+                self.master.reshape(self._blocked_shape),
+                scaling=fmt.scaling,
+                element_range=fmt.element_format.range,
+            )
+            # Scale is untrainable as we don't support grad clipping
+            self.scale = nn.Parameter(
+                fmt.scale_format.quantise(_squeeze_odd_dims(scale)), requires_grad=False
+            )
+        elif scaling_mode == "dynamic":
+            self._scaling = fmt.scaling
+            self._element_range = fmt.element_format.range
+        else:
+            assert False, f"Unknown scaling_mode={scaling_mode!r}"
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.master.shape
+
+    def count_bits(self, compute_dtype: torch.dtype) -> float:
+        rows, cols = self.master.shape
+        bits = cols * 8 * ((rows + 2) // 3)
+        bits += self._scale_format.count_bits(self._blocked_shape[::2])
+        bits += self.centroids.nelement() * self._element_value_bits
+        return bits
+
+    def _get_scale(self) -> Tensor:
+        if self.scaling_mode == "parameter":
+            return _unsqueeze_odd_dims(self.scale)
+        scale = Q.blocked_scale(
+            self.master.reshape(self._blocked_shape),
+            self._scaling,
+            self._element_range,
+        )
+        return self._scale_format.quantise(scale)
+
+    @torch.compiler.disable()
+    def forward(self) -> Tensor:
+        shape, scale = self.shape, self._get_scale()
+        weight = Q.safe_div(self.master.reshape(self._blocked_shape), scale).reshape(
+            shape
+        )
+        weight = Q.Sign3D8Format.vectorise(weight)
+        weight = Quantise_Vector_STE.apply(weight.abs(), self.centroids).copysign(
+            weight
+        )
+        weight = Q.Sign3D8Format.unvectorise(weight, shape)
+        return weight.reshape(self._blocked_shape).mul(scale).reshape(shape)
+
+    def extra_repr(self) -> str:
+        return ", ".join(map(str, self.shape))
+
+
 class UnquantisedWeight(nn.Module):
     def __init__(self, weight: Tensor):
         super().__init__()
@@ -210,7 +322,7 @@ class UnquantisedWeight(nn.Module):
 class Linear(nn.Module):
     def __init__(
         self,
-        weight: Weight | UnquantisedWeight,
+        weight: Weight | Sign3D8Weight | UnquantisedWeight,
         bias: nn.Parameter | None,
         activation_fmt: Q.TensorFormat | None,
     ):
@@ -246,11 +358,13 @@ def convert(
     error_weight: dict[str, Tensor] | None,
     activation_fmt: Q.TensorFormat | None,
     mode: Literal["qat", "one-shot"] = "qat",
+    progress: bool = False,
 ) -> None:
     """Recursively convert `module` to a trainable quantised model."""
 
     shared_weights = {}
     visited_modules = set([])
+    tqdm_ = tqdm.tqdm(disable=not progress, desc="Quantising")
 
     def _visit(parent: nn.Module, prefix: tuple[str, ...]) -> None:
         if parent in visited_modules:
@@ -284,6 +398,8 @@ def convert(
 
             # Substitute `child` to use a `Weight` module
             if replace_cls:
+                tqdm_.update(1)
+                tqdm_.set_postfix_str('.'.join(prefix + (name,)))
                 if child.weight in shared_weights:
                     # Copy the module, then share the parameters individually
                     src = shared_weights[child.weight]
@@ -308,7 +424,11 @@ def convert(
                         )
                     else:
                         # Construct quantised weight
-                        weight = Weight(child.weight, fmt, scaling_mode, clip_gradient)
+                        weight = (
+                            Sign3D8Weight(child.weight, fmt, scaling_mode)
+                            if Sign3D8Weight.is_supported(fmt)
+                            else Weight(child.weight, fmt, scaling_mode, clip_gradient)
+                        )
 
                         if mode == "one-shot":
                             with torch.no_grad():
@@ -320,6 +440,7 @@ def convert(
                 parent.add_module(name, replace_cls(weight, **replace_args))
 
     _visit(module, ())
+    tqdm_.close()
     module._quantisation_args = dict(
         activation_fmt=activation_fmt,
         scaling_mode=scaling_mode,
@@ -340,7 +461,7 @@ def get_named_parameters(
     results = []
     visited: set[nn.Parameter] = set([])
     for mname, m in module.named_modules():
-        if isinstance(m, Weight):
+        if isinstance(m, (Weight, Sign3D8Weight)):
             for n, p in m._parameters.items():
                 pkind = dict(
                     master="weight",
@@ -366,7 +487,7 @@ def count_bits(
     total = 0
     visited = set()
     for m in module.modules():
-        if isinstance(m, Weight):
+        if isinstance(m, (Weight, Sign3D8Weight)):
             if set(m.parameters()) - visited:
                 total += m.count_bits(compute_dtype)
                 visited |= set(m.parameters())
@@ -383,7 +504,7 @@ def count_parameters(module: nn.Module, include_other: bool = True) -> int:
     total = 0
     visited = set()
     for m in module.modules():
-        if isinstance(m, Weight):
+        if isinstance(m, (Weight, Sign3D8Weight)):
             if set(m.parameters()) - visited:
                 total += math.prod(m.shape)
                 visited |= set(m.parameters())
@@ -419,7 +540,7 @@ def save(module: nn.Module) -> dict[str, Tensor]:
     meta["fmt"] = {}
     for k, m in module.named_modules():
         k = k.replace("._orig_mod", "")
-        if isinstance(m, Weight):
+        if isinstance(m, (Weight, Sign3D8Weight)):
             meta["fmt"][k] = Q.TensorFormat.save(m.fmt)
         if isinstance(m, UnquantisedWeight):
             meta["fmt"][k] = Q.TensorFormat.save(Q.BFLOAT16)

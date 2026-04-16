@@ -2,6 +2,7 @@
 
 import copy
 
+import pytest
 import torch
 from torch import nn, tensor
 
@@ -9,9 +10,26 @@ from .. import fit as F
 from .. import quantisation as Q
 from .. import quantisation_training as T
 
-
 CHANNEL_ABSMAX_INT8 = Q.LinearScalingFormat(
     Q.IntFormat(8),
+    scale_format=Q.BFLOAT16,
+    block_shape=(1, None),
+    scaling="absmax",
+)
+
+SIGN_3D8 = Q.LinearScalingFormat(
+    Q.Sign3D8Format(
+        Q.VectorLUTFormat.create(
+            torch.cartesian_prod(  # dummy => (32, 3)
+                torch.linspace(0, 127, 4),
+                torch.linspace(0, 127, 4),
+                torch.linspace(0, 127, 2),
+            ),
+            Q.TorchFormat(torch.int8),
+            "S3D8",
+            range=(0, 127),
+        )
+    ),
     scale_format=Q.BFLOAT16,
     block_shape=(1, None),
     scaling="absmax",
@@ -124,6 +142,26 @@ def test_weight_gradients() -> None:
     assert weight.sparse_weight.grad.equal(torch.full((3,), 1.0))
 
 
+@pytest.mark.parametrize("scaling_mode", ["parameter", "dynamic"])
+def test_sign_3d8_weight_matches_format(scaling_mode: str) -> None:
+    torch.manual_seed(100)
+    reference_weight = torch.randn(32, 64).mul(0.01).bfloat16()
+    weight = T.Sign3D8Weight(reference_weight, SIGN_3D8, scaling_mode=scaling_mode)
+    weight.centroids.requires_grad_(False)
+    weight().pow(2).sum().backward()
+
+    torch.testing.assert_close(
+        weight(), SIGN_3D8.quantise(reference_weight)#, atol=atol, rtol=0
+    )
+    assert weight.count_bits(torch.bfloat16) == SIGN_3D8.count_bits(
+        reference_weight.shape
+    )
+    assert weight.master.grad is not None and weight.master.grad.abs().sum() > 0
+    if hasattr(weight, "scale"):
+        assert weight.scale.grad is None
+    assert weight.centroids.grad is None
+
+
 def test_convert_embedding() -> None:
     torch.manual_seed(100)
     model = nn.Embedding(100, 16, padding_idx=0)
@@ -230,6 +268,35 @@ def test_convert_and_train() -> None:
     T.load_convert(reloaded, T.save(model))
     torch.testing.assert_close(reloaded(input), model(input))
     assert T.count_bits(reloaded, torch.bfloat16) == T.count_bits(model, torch.bfloat16)
+
+
+def test_convert_and_train_sign_3d8() -> None:
+    torch.manual_seed(100)
+    reference = nn.Sequential(nn.Linear(128, 16, bias=False))
+    model = copy.deepcopy(reference)
+    T.convert(
+        model,
+        SIGN_3D8,
+        "parameter",
+        clip_gradient=False,
+        error_weight=None,
+        activation_fmt=None,
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    input = torch.randn(64, 128)
+    losses = []
+    for _ in range(3):
+        opt.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(input), reference(input))
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+
+    assert losses[-1] < losses[0]
+
+    reloaded = copy.deepcopy(reference)
+    T.load_convert(reloaded, T.save(model))
+    torch.testing.assert_close(reloaded(input), model(input))
 
 
 def test_convert_perturb_only() -> None:
