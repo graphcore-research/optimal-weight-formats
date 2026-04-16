@@ -11,6 +11,7 @@ import torch
 import tqdm
 from torch import Tensor, nn
 
+from .nearest_neighbour import nearest_neighbour
 from . import fit as F
 from . import quantisation as Q
 
@@ -56,7 +57,7 @@ class Quantise_STE(torch.autograd.Function):
 class Quantise_Vector_STE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor, centroids: Tensor) -> Tensor:
-        idx = Q._nearest_neighbour(x, centroids)
+        idx = nearest_neighbour(x, centroids)
         ctx.x_requires_grad = x.requires_grad
         ctx.centroids_requires_grad = centroids.requires_grad
         if centroids.requires_grad:

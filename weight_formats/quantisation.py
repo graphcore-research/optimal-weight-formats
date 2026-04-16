@@ -19,6 +19,8 @@ import torch
 import tqdm
 from torch import Tensor
 
+from .nearest_neighbour import nearest_neighbour
+
 Shape = Tuple[int, ...]
 
 # Utilities
@@ -415,32 +417,6 @@ class LUTFormat(ScalarFormat):
         return values[self.to_idx(x)]
 
 
-NEAREST_NEIGHBOUR_DEFAULT_MAX_BYTES = 8 * 2**30
-
-
-def _nearest_neighbour(
-    tensor: Tensor,
-    centroids: Tensor,
-    max_bytes: float | None = NEAREST_NEIGHBOUR_DEFAULT_MAX_BYTES,
-    out: Tensor | None = None,
-) -> Tensor:
-    if out is None:
-        out = torch.empty(tensor.shape[0], device=tensor.device, dtype=torch.int64)
-    chunk_size = (
-        tensor.shape[0]
-        if max_bytes is None
-        else int(max_bytes / (centroids.itemsize * centroids.shape[0]))
-    )
-    for i in builtins.range(0, tensor.shape[0], chunk_size):
-        chunk = slice(i, min(tensor.shape[0], i + chunk_size))
-        torch.argmin(
-            torch.cdist(tensor[chunk].to(centroids.dtype), centroids),
-            -1,
-            out=out[chunk],
-        )
-    return out
-
-
 @dataclass
 class VectorLUTFormat(ScalarFormat):
     """A Vector Quantisation (VQ) format via lookup table.
@@ -504,7 +480,7 @@ class VectorLUTFormat(ScalarFormat):
         values = self.element_type.quantise(
             torch.tensor(self.values, device=x.device, dtype=torch.float32)
         )
-        idx = _nearest_neighbour(x.view(-1, self.dim), values)
+        idx = nearest_neighbour(x.view(-1, self.dim), values)
         return values[idx].view(x.shape).to(x.dtype)
 
 
@@ -717,7 +693,7 @@ def _vector_lloyd_max_init(
         for i in range(0, n_centroids, step):
             n = min(step, n_centroids - i)
             centroids[i : i + n] = s[torch.multinomial(p / p.sum(), n)]
-            idx = _nearest_neighbour(s, centroids[: i + n])
+            idx = nearest_neighbour(s, centroids[: i + n])
             p = (s - centroids[idx]).pow(2).sum(-1)
         return centroids
     else:
@@ -759,7 +735,7 @@ def vlut_lloyd_max(
     tqdm_ = tqdm.tqdm(it.count(), disable=not progress)
     for _ in tqdm_:
         last_idx[:n] = idx[:n]
-        _nearest_neighbour(tensor[:n], centroids, out=idx[:n])
+        nearest_neighbour(tensor[:n], centroids, out=idx[:n])
         centroids.scatter_reduce_(
             0,
             idx[:n, None].expand(-1, dim),
