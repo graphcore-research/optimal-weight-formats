@@ -423,6 +423,7 @@ def _process_model(model: transformers.PreTrainedModel, test: Test) -> dict[str,
                 if test.error_weight is None
                 else fisher.fetch_fisher(model.config._name_or_path, model.device)
             ),
+            activation_fmt=None,
         )
         return {}
 

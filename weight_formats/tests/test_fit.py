@@ -63,3 +63,19 @@ def test_scaled() -> None:
             actual_b = fmt.count_bits_tensor(x) / x.nelement()
             assert expected_b - tol < actual_b < expected_b + tol
             assert Q.qrmse_norm(fmt, x).item() < 0.12  # empirical
+
+
+def test_scaled_s3d8() -> None:
+    torch.manual_seed(100)
+    x = torch.randn(64, 128).mul(1000).bfloat16()
+    fmt = F.Scaled(
+        element_bits=8 / 3,
+        element_family="s3d8",
+        scale_format=Q.BFLOAT16,
+        block_shape=(1, None),
+        scaling="absmax",
+        args=dict(threshold=1e-2),
+    ).fit(x)
+    assert isinstance(fmt, Q.LinearScalingFormat)
+    assert isinstance(fmt.element_format, Q.Sign3D8Format)
+    assert 0.15 < Q.qrmse_norm(fmt, x).item() < 0.25  # empirical

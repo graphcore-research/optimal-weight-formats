@@ -2,12 +2,38 @@
 
 import copy
 
+import pytest
 import torch
 from torch import nn, tensor
 
 from .. import fit as F
 from .. import quantisation as Q
 from .. import quantisation_training as T
+
+CHANNEL_ABSMAX_INT8 = Q.LinearScalingFormat(
+    Q.IntFormat(8),
+    scale_format=Q.BFLOAT16,
+    block_shape=(1, None),
+    scaling="absmax",
+)
+
+SIGN_3D8 = Q.LinearScalingFormat(
+    Q.Sign3D8Format(
+        Q.VectorLUTFormat.create(
+            torch.cartesian_prod(  # dummy => (32, 3)
+                torch.linspace(0, 127, 4),
+                torch.linspace(0, 127, 4),
+                torch.linspace(0, 127, 2),
+            ),
+            Q.TorchFormat(torch.int8),
+            "S3D8",
+            range=(0, 127),
+        )
+    ),
+    scale_format=Q.BFLOAT16,
+    block_shape=(1, None),
+    scaling="absmax",
+)
 
 
 def test_quantise_ste() -> None:
@@ -116,6 +142,26 @@ def test_weight_gradients() -> None:
     assert weight.sparse_weight.grad.equal(torch.full((3,), 1.0))
 
 
+@pytest.mark.parametrize("scaling_mode", ["parameter", "dynamic"])
+def test_sign_3d8_weight_matches_format(scaling_mode: str) -> None:
+    torch.manual_seed(100)
+    reference_weight = torch.randn(32, 64).mul(0.01).bfloat16()
+    weight = T.Sign3D8Weight(reference_weight, SIGN_3D8, scaling_mode=scaling_mode)
+    weight.centroids.requires_grad_(False)
+    weight().pow(2).sum().backward()
+
+    torch.testing.assert_close(
+        weight(), SIGN_3D8.quantise(reference_weight)#, atol=atol, rtol=0
+    )
+    assert weight.count_bits(torch.bfloat16) == SIGN_3D8.count_bits(
+        reference_weight.shape
+    )
+    assert weight.master.grad is not None and weight.master.grad.abs().sum() > 0
+    if hasattr(weight, "scale"):
+        assert weight.scale.grad is None
+    assert weight.centroids.grad is None
+
+
 def test_convert_embedding() -> None:
     torch.manual_seed(100)
     model = nn.Embedding(100, 16, padding_idx=0)
@@ -126,8 +172,40 @@ def test_convert_embedding() -> None:
         "dynamic",
         clip_gradient=False,
         error_weight=None,
+        activation_fmt=None,
     )
     assert model(input).shape == (5, 16)
+
+
+def test_convert_linear_with_activation_quantisation() -> None:
+    torch.manual_seed(100)
+    reference = nn.Sequential(nn.Linear(64, 32, bias=True))
+    model = copy.deepcopy(reference)
+    input = torch.randn(8, 16, 64).requires_grad_()
+
+    T.convert(
+        model,
+        Q.BFLOAT16,
+        "dynamic",
+        clip_gradient=False,
+        activation_fmt=CHANNEL_ABSMAX_INT8,
+        error_weight=None,
+    )
+
+    output = model(input)
+    reference_input = (
+        CHANNEL_ABSMAX_INT8.quantise(input.view(-1, 64))
+        .view_as(input)
+        .detach()
+        .clone()
+        .requires_grad_()
+    )
+    reference_output = reference(reference_input)
+    output.square().mean().backward()
+    reference_output.square().mean().backward()
+
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(input.grad, reference_input.grad)
 
 
 def test_convert_and_train() -> None:
@@ -157,6 +235,7 @@ def test_convert_and_train() -> None:
         scaling_mode="parameter",
         clip_gradient=True,
         error_weight=None,
+        activation_fmt=CHANNEL_ABSMAX_INT8,
     )
 
     bpp = T.count_bits(model, torch.bfloat16) / T.count_parameters(model)
@@ -191,6 +270,35 @@ def test_convert_and_train() -> None:
     assert T.count_bits(reloaded, torch.bfloat16) == T.count_bits(model, torch.bfloat16)
 
 
+def test_convert_and_train_sign_3d8() -> None:
+    torch.manual_seed(100)
+    reference = nn.Sequential(nn.Linear(128, 16, bias=False))
+    model = copy.deepcopy(reference)
+    T.convert(
+        model,
+        SIGN_3D8,
+        "parameter",
+        clip_gradient=False,
+        error_weight=None,
+        activation_fmt=None,
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    input = torch.randn(64, 128)
+    losses = []
+    for _ in range(3):
+        opt.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(input), reference(input))
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+
+    assert losses[-1] < losses[0]
+
+    reloaded = copy.deepcopy(reference)
+    T.load_convert(reloaded, T.save(model))
+    torch.testing.assert_close(reloaded(input), model(input))
+
+
 def test_convert_perturb_only() -> None:
     torch.manual_seed(100)
     reference = nn.Sequential(nn.Linear(64, 512, bias=False))
@@ -203,6 +311,7 @@ def test_convert_perturb_only() -> None:
         "dynamic",
         clip_gradient=False,
         error_weight=None,
+        activation_fmt=None,
     )
     T.convert(
         model_os,
@@ -211,6 +320,7 @@ def test_convert_perturb_only() -> None:
         clip_gradient=False,
         error_weight=None,
         mode="one-shot",
+        activation_fmt=None,
     )
     input = torch.randn(2048, 64)
 

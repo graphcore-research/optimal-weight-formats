@@ -19,6 +19,8 @@ import torch
 import tqdm
 from torch import Tensor
 
+from .nearest_neighbour import nearest_neighbour
+
 Shape = Tuple[int, ...]
 
 # Utilities
@@ -415,32 +417,6 @@ class LUTFormat(ScalarFormat):
         return values[self.to_idx(x)]
 
 
-NEAREST_NEIGHBOUR_DEFAULT_MAX_BYTES = 8 * 2**30
-
-
-def _nearest_neighbour(
-    tensor: Tensor,
-    centroids: Tensor,
-    max_bytes: float | None = NEAREST_NEIGHBOUR_DEFAULT_MAX_BYTES,
-    out: Tensor | None = None,
-) -> Tensor:
-    if out is None:
-        out = torch.empty(tensor.shape[0], device=tensor.device, dtype=torch.int64)
-    chunk_size = (
-        tensor.shape[0]
-        if max_bytes is None
-        else int(max_bytes / (centroids.itemsize * centroids.shape[0]))
-    )
-    for i in builtins.range(0, tensor.shape[0], chunk_size):
-        chunk = slice(i, min(tensor.shape[0], i + chunk_size))
-        torch.argmin(
-            torch.cdist(tensor[chunk].to(centroids.dtype), centroids),
-            -1,
-            out=out[chunk],
-        )
-    return out
-
-
 @dataclass
 class VectorLUTFormat(ScalarFormat):
     """A Vector Quantisation (VQ) format via lookup table.
@@ -504,8 +480,65 @@ class VectorLUTFormat(ScalarFormat):
         values = self.element_type.quantise(
             torch.tensor(self.values, device=x.device, dtype=torch.float32)
         )
-        idx = _nearest_neighbour(x.view(-1, self.dim), values)
+        idx = nearest_neighbour(x.view(-1, self.dim), values)
         return values[idx].view(x.shape).to(x.dtype)
+
+
+@dataclass
+class Sign3D8Format(ScalarFormat):
+    """A format for 2D tensors, which stores 3-vectors along rows in 8 bits / 3 values.
+
+    Each 3-vector is quantised to a 5-bit LUT index for the absolute value,
+    and the sign of each value is stored separately.
+
+    Note that this is not truly a scalar format (and does not support .bits), but
+    is marked as a `ScalarFormat` so that it can be used with `LinearScalingFormat`.
+    """
+
+    lut: VectorLUTFormat
+    _type: str = "s3d8"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lut, VectorLUTFormat):
+            raise ValueError("Sign3D8Format requires a VectorLUTFormat for `lut`")
+        if len(self.lut.values) != 32 or any(len(v) != 3 for v in self.lut.values):
+            raise ValueError("Sign3D8Format requires LUT with shape (32, 3)")
+
+    def __str__(self) -> str:
+        return f"Sign3D8{{{self.lut}}}"
+
+    @staticmethod
+    def vectorise(tensor: Tensor) -> Tensor:
+        rows, _ = tensor.shape
+        return torch.nn.functional.pad(tensor.T, (0, -(rows % -3))).reshape(-1, 3)
+
+    @staticmethod
+    def unvectorise(vectors: Tensor, shape: Shape) -> Tensor:
+        rows, cols = shape
+        return vectors.reshape(cols, -1)[:, :rows].T.reshape(shape)
+
+    def count_bits(self, shape: Shape) -> int:
+        rows, cols = shape
+        rows += -(rows % -3)  # padding
+        return self.lut.count_bits((rows, cols)) + rows * cols  # = abs + sign
+
+    @property
+    def range(self) -> tuple[float, float]:
+        _, lut_max = self.lut.range
+        return (-lut_max, lut_max)
+
+    @property
+    def bits(self) -> float:
+        raise NotImplementedError("Sign3D8Format does not implement `bits`")
+
+    def quantise(self, tensor: Tensor) -> Tensor:
+        if tensor.ndim != 2:
+            raise ValueError(
+                f"Sign3D8Format only supports rank-2 inputs (actual rank: {tensor.ndim})"
+            )
+        q = self.vectorise(tensor)
+        q = torch.copysign(self.lut.quantise(q.abs()), q)
+        return self.unvectorise(q, tensor.shape)
 
 
 # Lloyd-Max
@@ -660,7 +693,7 @@ def _vector_lloyd_max_init(
         for i in range(0, n_centroids, step):
             n = min(step, n_centroids - i)
             centroids[i : i + n] = s[torch.multinomial(p / p.sum(), n)]
-            idx = _nearest_neighbour(s, centroids[: i + n])
+            idx = nearest_neighbour(s, centroids[: i + n])
             p = (s - centroids[idx]).pow(2).sum(-1)
         return centroids
     else:
@@ -702,7 +735,7 @@ def vlut_lloyd_max(
     tqdm_ = tqdm.tqdm(it.count(), disable=not progress)
     for _ in tqdm_:
         last_idx[:n] = idx[:n]
-        _nearest_neighbour(tensor[:n], centroids, out=idx[:n])
+        nearest_neighbour(tensor[:n], centroids, out=idx[:n])
         centroids.scatter_reduce_(
             0,
             idx[:n, None].expand(-1, dim),
@@ -1436,6 +1469,41 @@ class CompressedLUTFormat(CompressedTensorFormat):
         return cls.train(
             lut_grid(resolution, data.abs().amax().item()), data=data, **args
         )
+
+
+# Factories
+
+
+def scaled_int8_3d8_lloyd_max(
+    tensor: Tensor,
+    scale_format: TensorFormat,
+    block_shape: BlockShape,
+    threshold: float,
+    **args: Any,
+) -> LinearScalingFormat:
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"scaled_int8_3d8_lloyd_max expects a rank-2 tensor, actual {tensor.ndim}"
+        )
+    element_type, scaling = TorchFormat(torch.int8), "absmax"
+    q_i8 = element_type.quantise(
+        block_normalise(
+            tensor,
+            block_shape=block_shape,
+            scaling=scaling,
+            element_range=element_type.range,
+            scale_format=scale_format,
+        )[0]
+    )
+    vfmt = vlut_lloyd_max(
+        Sign3D8Format.vectorise(q_i8).abs(),
+        bits=5 / 3,
+        range=(0, 127),
+        threshold=threshold,
+        element_type=element_type,
+        **args,
+    )
+    return LinearScalingFormat(Sign3D8Format(vfmt), scale_format, block_shape, scaling)
 
 
 # Type index

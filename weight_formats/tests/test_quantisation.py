@@ -221,9 +221,9 @@ def test_lloyd_max_crd() -> None:
 def test_vlut_lloyd_max() -> None:
     torch.manual_seed(100)
     x = torch.distributions.StudentT(5).sample((2**16,))
-    sfmt = Q.lut_lloyd_max(x, 2, 10**-3)
+    sfmt = Q.lut_lloyd_max(x, 3, 10**-3)
     for init in ["random", "kmeans++"]:
-        vfmt = Q.vlut_lloyd_max(x.view(-1, 2), 2, 10**-3, Q.BFLOAT16, init=init)
+        vfmt = Q.vlut_lloyd_max(x.view(-1, 2), 3, 10**-3, Q.BFLOAT16, init=init)
         assert Q.qrmse_norm(vfmt, x).item() < Q.qrmse_norm(sfmt, x).item() - 0.01, init
 
 
@@ -295,3 +295,22 @@ def test_compressed_lut_format() -> None:
     )
     torch.testing.assert_close(fmt.quantise(tensor([-3, 1.2])), tensor([-2.0, 1]))
     assert fmt.count_bits_tensor(tensor([0, 0, 0, 0, 3])) == 4 * 1 + 3
+
+
+def test_scaled_int8_3d8_lloyd_max_format() -> None:
+    torch.manual_seed(100)
+    x = torch.randn(256, 128)
+
+    fmt = Q.scaled_int8_3d8_lloyd_max(x, Q.BFLOAT16, (1, None), threshold=1e-2)
+
+    scale_bits = 256 * 16
+    data_bits = (256 + 2) // 3 * 128 * 8
+    table_bits = 8 * 32 * 3
+    assert fmt.count_bits_tensor(x) == scale_bits + data_bits + table_bits
+
+    q = fmt.quantise(x)
+    assert q.shape == x.shape
+    assert 0.15 < Q.qrmse_norm(fmt, x).item() < 0.25  # empirical
+
+    fmt_reloaded = Q.TensorFormat.load(json.loads(json.dumps(Q.TensorFormat.save(fmt))))
+    torch.testing.assert_close(fmt_reloaded.quantise(x), q)

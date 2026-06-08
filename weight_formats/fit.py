@@ -5,7 +5,7 @@
 import dataclasses
 from dataclasses import dataclass
 from math import log2, prod
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 import scipy.optimize
 import torch
@@ -14,6 +14,10 @@ from torch import Tensor
 from . import quantisation as Q
 
 MAX_ROTATION_SIZE = 32768
+
+ElementFamily: TypeAlias = Literal[
+    "int", "fp", "normal", "laplace", "t", "lloyd_max", "s3d8"
+]
 
 
 @dataclass
@@ -27,10 +31,11 @@ class Scaled:
         laplace -- see `Q.crd_laplace` and `Q.crd_block_laplace`
         t -- see `Q.crd_t` and `Q.crd_block_t` (if `df` is specified, disable as search axis)
         lloyd_max -- see `Q.lut_lloyd_max`, e.g. "init", "threshold"
+        s3d8 -- see `Q.scaled_int8_3d8_lloyd_max`
     """
 
     element_bits: float
-    element_family: Literal["int", "fp", "normal", "laplace", "t", "lloyd_max"]
+    element_family: ElementFamily
     scale_format: Q.TensorFormat
     block_shape: Q.BlockShape
     scaling: Q.Scaling
@@ -89,6 +94,8 @@ class Scaled:
             return False
         if self.element_family == "lloyd_max":
             return True
+        if self.element_family == "s3d8":
+            return False
         if self.element_family == "fp" and "exponent_bits" not in self.args:
             return True
         if self.element_family == "t" and "df" not in self.args:
@@ -181,7 +188,7 @@ def _scaled_element_format(
     tensor: Tensor,
     error_weight: Tensor | None,
     element_bits: float,
-    element_family: Literal["int", "fp", "normal", "laplace", "t", "lloyd_max"],
+    element_family: ElementFamily,
     scale_format: Q.TensorFormat,
     block_shape: Q.BlockShape,
     scaling: Q.Scaling,
@@ -245,6 +252,18 @@ def _scaled_element_format(
         return Q.lut_lloyd_max(
             tensor, element_bits, weight=error_weight, range=(-1, 1), **args
         )
+
+    if element_family == "s3d8":
+        assert element_bits == 8 / 3, "s3d8 only supports element_bits=8/3"
+        assert vq_format is None, "s3d8 doesn't support vq_format"
+        assert scaling == "absmax", "s3d8 only supports absmax scaling"
+        # Train a signed VQ[3] int8 quantiser on the normalised tensor
+        args = args.copy()
+        # Default threshold: shorter vectors than general VQ, but still expensive
+        args.setdefault("threshold", 1e-3)
+        return Q.scaled_int8_3d8_lloyd_max(
+            tensor, scale_format=scale_format, block_shape=block_shape, **args
+        ).element_format
 
     FIND_SCALED_FORMAT_STEPS = 17
 
