@@ -6,4 +6,6 @@ apt install -y build-essential git-core
 
 python -m venv .venv-docker
 source .venv-docker/bin/activate
+pip install --upgrade pip wheel
 pip install -r requirements.txt
+pip install --no-deps -e .

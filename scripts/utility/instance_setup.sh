@@ -32,5 +32,6 @@ mkdir -p ~/weight-formats/out
 python3 -m venv ~/weight-formats/venv
 # python3 -m venv --system-site-packages ~/weight-formats/venv  # GH200
 source .venv/bin/activate
+pip install --upgrade pip wheel
 pip install -r requirements-base.txt
-echo 'export PYTHONPATH="${PYTHONPATH}:${HOME}/work"' >> .venv/bin/activate
+pip install --no-deps -e "${PROJECT_DIR}"

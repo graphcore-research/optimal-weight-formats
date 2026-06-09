@@ -34,7 +34,9 @@ if __name__ == "__main__":
     sh(["git", "checkout", COMMIT])
     if not Path(".venv").exists():
         sh(["python3", "-m", "venv", ".venv"])
+        sh([".venv/bin/pip", "install", "--upgrade", "pip", "wheel"])
         sh([".venv/bin/pip", "install", "-r", "requirements.txt"])
+        sh([".venv/bin/pip", "install", "--no-deps", "-e", "."])
 
     # Run
     sh([".venv/bin/python", "-m", RUNNER], input=JOB)

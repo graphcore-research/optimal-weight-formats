@@ -1,0 +1,72 @@
+[project]
+name = "optimal-weight-formats"
+version = "0.1.0"
+description = "Reference implementation of the paper: Optimal Formats for Weight Quantisation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Graphcore Research" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "accelerate>=1.6.0",
+    "arithmetic-compressor>=0.2",
+    "boto3>=1.37.35",
+    "botocore>=1.37.38",
+    "dahuffman>=0.4.2",
+    "datasets>=3.5.0",
+    "numpy>=1.26",
+    "safetensors>=0.5.3",
+    "scipy>=1.15.2",
+    "torch>=2.6.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.50.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/graphcore-research/optimal-weight-formats"
+Paper = "https://arxiv.org/abs/2505.12988"
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=6.29.5",
+    "matplotlib>=3.10.1",
+    "mypy>=1.15.0",
+    "pandas>=2.2.3",
+    "pytest>=8.3.5",
+    "seaborn>=0.13.2",
+]
+eval = [
+    "ai2-olmes @ git+https://github.com/allenai/olmes@4f04122642bcee6d74393ec2ecfb0e572a64da53",
+]
+triton = [
+    "triton>=3.2.0",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["weight_formats*"]
+
+[tool.setuptools.package-data]
+"weight_formats.experiments.internal" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::DeprecationWarning:alpaca_eval.utils",
+    "ignore::DeprecationWarning:websockets.legacy.*",
+    "ignore::DeprecationWarning:pydantic._internal._config",
+]

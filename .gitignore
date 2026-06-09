@@ -1,5 +1,6 @@
 Dev.ipynb
 __pycache__
+*.egg-info/
 .results
 .venv*
 .vscode

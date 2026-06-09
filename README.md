@@ -14,15 +14,26 @@ We recommend starting with [`Demo.ipynb`](Demo.ipynb) for an introduction to the
  - [`Usage.ipynb`](Usage.ipynb) - tutorial for using the package directly
 
 
+## Installing as a dependency
+
+```sh
+pip install "optimal-weight-formats @ git+https://github.com/graphcore-research/optimal-weight-formats.git@<commit-or-tag>"
+```
+
+The installed distribution name is `optimal-weight-formats`; use as `import weight_formats`.
+
+
 ## Development
 
 ```sh
 python3 -m venv .venv
-echo 'export PYTHONPATH="${PYTHONPATH}:$(dirname ${VIRTUAL_ENV})"' >> .venv/bin/activate
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --upgrade pip wheel
+pip install -e ".[dev,triton]"
 ./scripts/check.sh
 ```
+
+Note: the pinned [`requirements.txt`](requirements.txt) is retained as a known-good environment used for the paper experiments.
 
 
 ## License
