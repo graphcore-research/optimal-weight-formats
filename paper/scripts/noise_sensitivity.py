@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Graphcore Ltd.
+
 import weight_formats.experiments as E
 import weight_formats.experiments.token_prediction as ET
 

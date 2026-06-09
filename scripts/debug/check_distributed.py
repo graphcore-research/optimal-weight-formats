@@ -1,3 +1,5 @@
+# Copyright (c) 2025 Graphcore Ltd.
+
 import torch
 import sys
 import torch.multiprocessing as multiprocessing
